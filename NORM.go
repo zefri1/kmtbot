@@ -1,9 +1,11 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"io/ioutil"
 	"log"
+	"net/http"
 	"os"
 	"regexp"
 	"strconv"
@@ -11,13 +13,16 @@ import (
 	"sync"
 	"time"
 
-	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 	"github.com/gocolly/colly/v2"
+	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 )
 
 const (
-	telegramToken = "8066179082:AAHAhf67ZlR1A_rZGUR-xe8nCj70sv43C80"             // Замените на токен вашего бота
-	url           = "https://kmtko.my1.ru/index/raspisanie_zanjatij_ochno/0-403" // Исправлено: убраны лишние пробелы
+	telegramToken = "8066179082:AAHAhf67ZlR1A_rZGUR-xe8nCj70sv43C80"
+	// Исправлено: Убраны лишние пробелы
+	url = "https://kmtko.my1.ru/index/raspisanie_zanjatij_ochno/0-403"
+	// Путь для вебхука
+	webhookPath = "/webhook"
 )
 
 // ScheduleData хранит информацию о расписании для конкретного корпуса
@@ -33,55 +38,117 @@ var scheduleB = make(map[string]time.Time) // URL -> Date
 var mu sync.RWMutex
 
 var uniqueUsers = make(map[int64]string)
+var bot *tgbotapi.BotAPI // Глобальная переменная для бота
 
 func main() {
-	bot, err := tgbotapi.NewBotAPI(telegramToken)
+	var err error
+	bot, err = tgbotapi.NewBotAPI(telegramToken)
 	if err != nil {
 		log.Fatalf("Ошибка при создании бота: %v", err)
 	}
 	log.Printf("Авторизован как: %s", bot.Self.UserName)
-	//loadUsers() // Закомментировано, как в предыдущей версии
 
+	// --- Настройка вебхука ---
+	// Получаем базовый URL сервиса от Render или используем localhost для тестирования
+	externalURL := os.Getenv("RENDER_EXTERNAL_URL")
+	if externalURL == "" {
+		// Для локального тестирования можно задать вручную или использовать localhost
+		// ВАЖНО: Для локального тестирования вебхуков нужен туннель (ngrok, localtunnel и т.д.)
+		externalURL = "http://localhost:8080" // Замените на ваш локальный адрес при тестировании
+		log.Println("RENDER_EXTERNAL_URL не найден, использую localhost для тестирования. Для продакшена это не сработает.")
+	}
+	webhookURL := externalURL + webhookPath
+
+    // Регистрируем вебхук у Telegram
+    wh, err := tgbotapi.NewWebhook(webhookURL) // В v5 NewWebhook возвращает только WebhookConfig
+    // Исправлено: Используем bot.Request для отправки конфигурации вебхука
+    _, err = bot.Request(wh)
+    if err != nil {
+        log.Fatalf("Ошибка при установке вебхука: %v", err)
+    }
+    log.Printf("Вебхук установлен на: %s", webhookURL)
 	// Запуск скрапинга в отдельной горутине
 	go func() {
 		for {
 			scrapeImages()
-			time.Sleep(30 * time.Minute) // Пауза между проверками
+			// Уменьшаем интервал для более быстрого обновления при тестировании
+			// В продакшене можно вернуть 30 минут
+			time.Sleep(10 * time.Minute) // Пауза между проверками
 		}
 	}()
 
-	u := tgbotapi.NewUpdate(0)
-	u.Timeout = 60
-
-	// Исправлено: Убрана попытка получить ошибку от GetUpdatesChan, которая не возвращает ошибку в v5
-	updates := bot.GetUpdatesChan(u)
-	// if err != nil { // Эта проверка больше не нужна
-	// 	log.Fatalf("Ошибка при получении обновлений: %v", err)
-	// }
-
-	for update := range updates {
-		countUniqueUsers(bot, update)
-
-		// Обработка команды /start
-		if update.Message != nil && update.Message.IsCommand() && update.Message.Command() == "start" {
-			log.Printf("Пользователь %d запросил /start", update.Message.Chat.ID)
-			sendStartMessage(bot, update.Message.Chat.ID)
-		} else if update.Message != nil {
-			// Обработка текстовых сообщений (кнопок)
-			switch update.Message.Text {
-			case "Расписание А":
-				log.Printf("Пользователь %d запросил расписание А", update.Message.Chat.ID)
-				sendSchedule(bot, update.Message.Chat.ID, "A")
-			case "Расписание Б":
-				log.Printf("Пользователь %d запросил расписание Б", update.Message.Chat.ID)
-				sendSchedule(bot, update.Message.Chat.ID, "B")
-			case "Поддержка и предложения": // Обработка новой кнопки
-				log.Printf("Пользователь %d запросил поддержку/предложения", update.Message.Chat.ID)
-				sendSupportMessage(bot, update.Message.Chat.ID) // Вызов новой функции
-			}
+	// --- Настройка HTTP-сервера ---
+	// Обработчик для пути вебхука
+	http.HandleFunc(webhookPath, handleWebhook)
+	// Обработчик для корневого пути (для проверки и пинга)
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/" {
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte("Бот запущен и слушает вебхуки на /webhook"))
+			log.Println("Получен запрос на корневой путь")
+		} else {
+			// Если путь неизвестен, возвращаем 404
+			http.NotFound(w, r)
 		}
-		// CallbackQuery больше не используется, так как работаем с ReplyKeyboard
+	})
+
+	// Получаем порт из переменной окружения PORT, которую Render предоставляет,
+	// или используем 8080 по умолчанию для локального тестирования.
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080" // Используем 8080 вместо 10000 для локального тестирования
 	}
+
+	log.Printf("HTTP-сервер запущен на порту %s", port)
+	// Запускаем HTTP-сервер. Это блокирующая операция.
+	log.Fatal(http.ListenAndServe(":"+port, nil))
+	// --- Конец настройки HTTP-сервера ---
+}
+
+// handleWebhook обрабатывает входящие обновления от Telegram
+func handleWebhook(w http.ResponseWriter, r *http.Request) {
+	var update tgbotapi.Update
+	// Декодируем JSON из тела POST-запроса в структуру Update
+	if err := json.NewDecoder(r.Body).Decode(&update); err != nil {
+		log.Printf("Ошибка декодирования обновления: %v", err)
+		http.Error(w, "Bad Request", http.StatusBadRequest)
+		return
+	}
+
+	// Обрабатываем обновление в отдельной горутине, чтобы не блокировать обработку следующих запросов
+	go processUpdate(update)
+
+	// Отвечаем Telegram, что запрос принят (обычно 200 OK достаточно)
+	w.WriteHeader(http.StatusOK)
+}
+
+// processUpdate - это логика обработки одного обновления (перенос из цикла for)
+func processUpdate(update tgbotapi.Update) {
+	// Предполагая, что вы хотите сохранять пользователей
+	// ВАЖНО: loadUsers() был отключен, поэтому uniqueUsers будет пустым при перезапуске
+	// если вы снова включите loadUsers, убедитесь, что saveUsers работает корректно
+	// с учетом эфемерной файловой системы Render.
+	countUniqueUsers(bot, update)
+
+	// Обработка команды /start
+	if update.Message != nil && update.Message.IsCommand() && update.Message.Command() == "start" {
+		log.Printf("Пользователь %d запросил /start", update.Message.Chat.ID)
+		sendStartMessage(bot, update.Message.Chat.ID)
+	} else if update.Message != nil {
+		// Обработка текстовых сообщений (кнопок)
+		switch update.Message.Text {
+		case "Расписание А":
+			log.Printf("Пользователь %d запросил расписание А", update.Message.Chat.ID)
+			sendSchedule(bot, update.Message.Chat.ID, "A")
+		case "Расписание Б":
+			log.Printf("Пользователь %d запросил расписание Б", update.Message.Chat.ID)
+			sendSchedule(bot, update.Message.Chat.ID, "B")
+		case "Поддержка и предложения":
+			log.Printf("Пользователь %d запросил поддержку/предложения", update.Message.Chat.ID)
+			sendSupportMessage(bot, update.Message.Chat.ID)
+		}
+	}
+	// ... обработка других типов обновлений (CallbackQuery и т.д., если нужно) ...
 }
 
 // scrapeImages парсит страницу и обновляет расписания для корпусов А и Б
@@ -115,8 +182,8 @@ func scrapeImages() {
 			return
 		}
 
-		dayStr := matches[1]                        // "5" или "05"
-		monthStr := matches[2]                      // "9" или "09"
+		dayStr := matches[1]   // "5" или "05"
+		monthStr := matches[2] // "9" или "09"
 		corpusLetter := strings.ToLower(matches[3]) // "a" или "v"
 
 		// Парсим день и месяц
@@ -246,7 +313,7 @@ func sendImageToTelegram(bot *tgbotapi.BotAPI, chatID int64, imageURL string, im
 	// Всегда показываем дату в текущем году
 	dateStr = fmt.Sprintf("%s, %d %s", weekdayStr, imageDate.Day(), months[imageDate.Month()])
 
-	// Исправлено: Используем NewPhoto вместо NewPhotoShare для v5
+	// Исправлено: Используем NewPhoto с FileURL для v5
 	msg := tgbotapi.NewPhoto(chatID, tgbotapi.FileURL(imageURL))
 	msg.Caption = fmt.Sprintf("Расписание на %s", dateStr)
 	_, err := bot.Send(msg)
@@ -296,6 +363,8 @@ func sendSupportMessage(bot *tgbotapi.BotAPI, chatID int64) {
 
 // --- Функции для работы с пользователями ---
 // (Функции loadUsers, saveUsers, countUniqueUsers остаются без изменений)
+// ВАЖНО: loadUsers() был отключен ранее. Если вы снова его включите,
+// помните о проблеме с эфемерной файловой системой Render.
 func loadUsers() {
 	data, err := ioutil.ReadFile("USER1.TXT")
 	if err != nil {
