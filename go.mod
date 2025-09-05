@@ -3,8 +3,8 @@ module kmtbot
 go 1.23.1
 
 require (
-	github.com/go-telegram-bot-api/telegram-bot-api/v5
-	github.com/gocolly/colly/v2
+	github.com/go-telegram-bot-api/telegram-bot-api/v5 v5.6.0
+    	github.com/gocolly/colly/v2 v2.1.0
 )
 
 require (
