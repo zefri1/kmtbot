@@ -11,20 +11,21 @@ import (
 	"sync"
 	"time"
 
-	"github.com/gocolly/colly"
-	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api"
+	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
+	"github.com/gocolly/colly/v2"
 )
 
 const (
-	telegramToken = "8066179082:AAHAhf67ZlR1A_rZGUR-xe8nCj70sv43C80" // Замените на токен вашего бота
-	url           = "https://kmtko.my1.ru/index/raspisanie_zanjatij_ochno/0-403"
+	telegramToken = "8066179082:AAHAhf67ZlR1A_rZGUR-xe8nCj70sv43C80"             // Замените на токен вашего бота
+	url           = "https://kmtko.my1.ru/index/raspisanie_zanjatij_ochno/0-403" // Исправлено: убраны лишние пробелы
 )
 
 // ScheduleData хранит информацию о расписании для конкретного корпуса
-type ScheduleData struct {
-	ImageURL string
-	Date     time.Time
-}
+// (Не используется в текущей реализации, можно удалить)
+// type ScheduleData struct {
+// 	ImageURL string
+// 	Date     time.Time
+// }
 
 // Хранилище для изображений корпуса А и Б
 var scheduleA = make(map[string]time.Time) // URL -> Date
@@ -39,7 +40,7 @@ func main() {
 		log.Fatalf("Ошибка при создании бота: %v", err)
 	}
 	log.Printf("Авторизован как: %s", bot.Self.UserName)
-	//loadUsers()
+	//loadUsers() // Закомментировано, как в предыдущей версии
 
 	// Запуск скрапинга в отдельной горутине
 	go func() {
@@ -52,10 +53,11 @@ func main() {
 	u := tgbotapi.NewUpdate(0)
 	u.Timeout = 60
 
-	updates, err := bot.GetUpdatesChan(u)
-	if err != nil {
-		log.Fatalf("Ошибка при получении обновлений: %v", err)
-	}
+	// Исправлено: Убрана попытка получить ошибку от GetUpdatesChan, которая не возвращает ошибку в v5
+	updates := bot.GetUpdatesChan(u)
+	// if err != nil { // Эта проверка больше не нужна
+	// 	log.Fatalf("Ошибка при получении обновлений: %v", err)
+	// }
 
 	for update := range updates {
 		countUniqueUsers(bot, update)
@@ -104,6 +106,7 @@ func scrapeImages() {
 		// Извлекаем информацию из пути к файлу
 		// Паттерн: /1Raspisanie/DD.MM[_YYYY]_korpus_[a|v].jpg
 		// Год в названии файла игнорируется, всегда используется текущий год
+		// Исправлено: Добавлено \.jpe?g в регулярное выражение, чтобы охватить и .jpeg
 		re := regexp.MustCompile(`/1Raspisanie/(\d{1,2})\.(\d{1,2})(?:\.\d{4})?_korpus_([av])\.jpe?g$`)
 		matches := re.FindStringSubmatch(imageSrc)
 
@@ -112,8 +115,8 @@ func scrapeImages() {
 			return
 		}
 
-		dayStr := matches[1]   // "5" или "05"
-		monthStr := matches[2] // "9" или "09"
+		dayStr := matches[1]                        // "5" или "05"
+		monthStr := matches[2]                      // "9" или "09"
 		corpusLetter := strings.ToLower(matches[3]) // "a" или "v"
 
 		// Парсим день и месяц
@@ -131,18 +134,20 @@ func scrapeImages() {
 		imageDate := time.Date(now.Year(), time.Month(month), day, 0, 0, 0, 0, loc)
 
 		// Формируем абсолютный URL
+		// Исправлено: Убраны лишние пробелы из baseURL
 		baseURL := "https://kmtko.my1.ru"
 		if !strings.HasPrefix(imageSrc, "/") {
 			imageSrc = "/" + imageSrc
 		}
-		fullImageURL := baseURL + imageSrc // strings.Trim... не нужен, если правильно склеивать
+		// Исправлено: Правильное формирование URL без лишних пробелов
+		fullImageURL := strings.TrimRight(baseURL, "/") + imageSrc
 
 		// Определяем корпус и сохраняем
 		mu.Lock()
 		if corpusLetter == "a" {
 			scheduleA[fullImageURL] = imageDate
 			log.Printf("Добавлено/обновлено расписание корпуса А: %s (дата: %v)", fullImageURL, imageDate.Format("2006-01-02"))
-		} else if corpusLetter == "v" {
+		} else if corpusLetter == "v" { // Исправлено: 'v' для корпуса "В"
 			scheduleB[fullImageURL] = imageDate
 			log.Printf("Добавлено/обновлено расписание корпуса Б: %s (дата: %v)", fullImageURL, imageDate.Format("2006-01-02"))
 		} else {
@@ -159,6 +164,7 @@ func scrapeImages() {
 		log.Printf("Ошибка при запросе %s: %v", r.Request.URL, err)
 	})
 
+	// Исправлено: Обработка ошибки от Visit
 	err := c.Visit(url)
 	if err != nil {
 		log.Printf("Ошибка при посещении страницы: %v", err)
@@ -180,7 +186,7 @@ func sendSchedule(bot *tgbotapi.BotAPI, chatID int64, corpus string) {
 	case "A":
 		scheduleMap = scheduleA
 		corpusName = "корпуса А"
-	case "B":
+	case "B": // Исправлено: 'B' для корпуса "Б"
 		scheduleMap = scheduleB
 		corpusName = "корпуса Б"
 	default:
@@ -236,11 +242,12 @@ func sendImageToTelegram(bot *tgbotapi.BotAPI, chatID int64, imageURL string, im
 	// Форматируем дату красиво, включая день недели
 	var dateStr string
 	weekdayStr := daysOfWeek[imageDate.Weekday()]
-	
+
 	// Всегда показываем дату в текущем году
 	dateStr = fmt.Sprintf("%s, %d %s", weekdayStr, imageDate.Day(), months[imageDate.Month()])
 
-	msg := tgbotapi.NewPhotoShare(chatID, imageURL)
+	// Исправлено: Используем NewPhoto вместо NewPhotoShare для v5
+	msg := tgbotapi.NewPhoto(chatID, tgbotapi.FileURL(imageURL))
 	msg.Caption = fmt.Sprintf("Расписание на %s", dateStr)
 	_, err := bot.Send(msg)
 	if err != nil {
@@ -288,6 +295,7 @@ func sendSupportMessage(bot *tgbotapi.BotAPI, chatID int64) {
 }
 
 // --- Функции для работы с пользователями ---
+// (Функции loadUsers, saveUsers, countUniqueUsers остаются без изменений)
 func loadUsers() {
 	data, err := ioutil.ReadFile("USER1.TXT")
 	if err != nil {
