@@ -1,11 +1,12 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"log"
 	"net/http"
+	_ "net/http/pprof" // включаем pprof на /debug/pprof/ (локально)
 	"os"
 	"regexp"
 	"strconv"
@@ -13,239 +14,295 @@ import (
 	"sync"
 	"time"
 
-	"github.com/gocolly/colly/v2"
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
+	"github.com/gocolly/colly/v2"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 const (
-	telegramToken = "8066179082:AAHAhf67ZlR1A_rZGUR-xe8nCj70sv43C80"
-	// Исправлено: Убраны лишние пробелы
-	url = "https://kmtko.my1.ru/index/raspisanie_zanjatij_ochno/0-403"
-	// Путь для вебхука
 	webhookPath = "/webhook"
 )
 
-// ScheduleData хранит информацию о расписании для конкретного корпуса
-// (Не используется в текущей реализации, можно удалить)
-// type ScheduleData struct {
-// 	ImageURL string
-// 	Date     time.Time
-// }
-
-// Хранилище для изображений корпуса А и Б
-var scheduleA = make(map[string]time.Time) // URL -> Date
-var scheduleB = make(map[string]time.Time) // URL -> Date
-var mu sync.RWMutex
-
-var uniqueUsers = make(map[int64]string)
-var bot *tgbotapi.BotAPI // Глобальная переменная для бота
+// глобальные переменные
+var (
+	bot       *tgbotapi.BotAPI
+	db        *pgxpool.Pool
+	mu        sync.RWMutex
+	scheduleA = make(map[string]time.Time) // URL -> date
+	scheduleB = make(map[string]time.Time)
+)
 
 func main() {
-	var err error
+	// Читаем переменные окружения
+	telegramToken := os.Getenv("TELEGRAM_TOKEN")
+	if telegramToken == "" {
+		log.Fatal("TELEGRAM_TOKEN не задан. Установите переменную окружения.")
+	}
+	databaseURL := os.Getenv("DATABASE_URL")
+	if databaseURL == "" {
+		log.Fatal("DATABASE_URL не задан. Установите переменную окружения.")
+	}
+
+	// Инициализируем пул Postgres
+	ctx := context.Background()
+	cfg, err := pgxpool.ParseConfig(databaseURL)
+	if err != nil {
+		log.Fatalf("pgxpool.ParseConfig: %v", err)
+	}
+	// Рекомендуемые настройки (подберите по своему инстансу)
+	cfg.MaxConns = 10
+	cfg.MinConns = 1
+	cfg.MaxConnLifetime = 30 * time.Minute
+
+	db, err = pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		log.Fatalf("pgxpool.NewWithConfig: %v", err)
+	}
+	defer db.Close()
+
+	// Проверка соединения
+	if err := db.Ping(ctx); err != nil {
+		log.Fatalf("Не удалось подключиться к БД: %v", err)
+	}
+	log.Println("Успешно подключились к Postgres")
+
+	// Простая миграция: создаём таблицу users, если её нет
+	if err := ensureUsersTable(ctx); err != nil {
+		log.Fatalf("ensureUsersTable: %v", err)
+	}
+
+	// Инициализируем Telegram Bot API
 	bot, err = tgbotapi.NewBotAPI(telegramToken)
 	if err != nil {
 		log.Fatalf("Ошибка при создании бота: %v", err)
 	}
 	log.Printf("Авторизован как: %s", bot.Self.UserName)
 
-	// --- Настройка вебхука ---
-	// Получаем базовый URL сервиса от Render или используем localhost для тестирования
+	// Настройка вебхука
 	externalURL := os.Getenv("RENDER_EXTERNAL_URL")
 	if externalURL == "" {
-		// Для локального тестирования можно задать вручную или использовать localhost
-		// ВАЖНО: Для локального тестирования вебхуков нужен туннель (ngrok, localtunnel и т.д.)
-		externalURL = "http://localhost:8080" // Замените на ваш локальный адрес при тестировании
-		log.Println("RENDER_EXTERNAL_URL не найден, использую localhost для тестирования. Для продакшена это не сработает.")
+		externalURL = "http://localhost:8080" // локально
+		log.Println("RENDER_EXTERNAL_URL не найден, использую localhost (локально).")
 	}
 	webhookURL := externalURL + webhookPath
 
-    // Регистрируем вебхук у Telegram
-    wh, err := tgbotapi.NewWebhook(webhookURL) // В v5 NewWebhook возвращает только WebhookConfig
-    // Исправлено: Используем bot.Request для отправки конфигурации вебхука
-    _, err = bot.Request(wh)
-    if err != nil {
-        log.Fatalf("Ошибка при установке вебхука: %v", err)
-    }
-    log.Printf("Вебхук установлен на: %s", webhookURL)
-	// Запуск скрапинга в отдельной горутине
+	wh, err := tgbotapi.NewWebhook(webhookURL)
+	if err != nil {
+		log.Fatalf("Ошибка при создании webhook: %v", err)
+	}
+	_, err = bot.Request(wh)
+	if err != nil {
+		log.Fatalf("Ошибка при установке вебхука: %v", err)
+	}
+
+	if err != nil {
+		log.Fatalf("Ошибка при установке вебхука: %v", err)
+	}
+	log.Printf("Вебхук установлен на: %s", webhookURL)
+
+	// Запускаем pprof (локально доступен на :6060 если вы захотите изменить)
+	go func() {
+		// на Render порт 6060 скорее всего недоступен извне, но локально полезно
+		log.Println("pprof слушает на :6060 (локально)")
+		log.Fatal(http.ListenAndServe(":6060", nil))
+	}()
+
+	// Запускаем скрейпер в фоне
 	go func() {
 		for {
 			scrapeImages()
-			// Уменьшаем интервал для более быстрого обновления при тестировании
-			// В продакшене можно вернуть 30 минут
-			time.Sleep(10 * time.Minute) // Пауза между проверками
+			time.Sleep(10 * time.Minute) // интервал сканирования
 		}
 	}()
 
-	// --- Настройка HTTP-сервера ---
-	// Обработчик для пути вебхука
+	// HTTP handlers
 	http.HandleFunc(webhookPath, handleWebhook)
-	// Обработчик для корневого пути (для проверки и пинга)
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/" {
 			w.WriteHeader(http.StatusOK)
-			w.Write([]byte("Бот запущен и слушает вебхуки на /webhook"))
-			log.Println("Получен запрос на корневой путь")
-		} else {
-			// Если путь неизвестен, возвращаем 404
-			http.NotFound(w, r)
+			w.Write([]byte("Bot running"))
+			return
 		}
+		http.NotFound(w, r)
+	})
+	// health endpoint
+	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+		defer cancel()
+		if err := db.Ping(ctx); err != nil {
+			http.Error(w, "db error", http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("ok"))
 	})
 
-	// Получаем порт из переменной окружения PORT, которую Render предоставляет,
-	// или используем 8080 по умолчанию для локального тестирования.
 	port := os.Getenv("PORT")
 	if port == "" {
-		port = "8080" // Используем 8080 вместо 10000 для локального тестирования
+		port = "8080"
 	}
 
-	log.Printf("HTTP-сервер запущен на порту %s", port)
-	// Запускаем HTTP-сервер. Это блокирующая операция.
+	log.Printf("HTTP-сервер стартует на :%s", port)
 	log.Fatal(http.ListenAndServe(":"+port, nil))
-	// --- Конец настройки HTTP-сервера ---
 }
 
-// handleWebhook обрабатывает входящие обновления от Telegram
+// ensureUsersTable создаёт таблицу users, если её нет
+func ensureUsersTable(ctx context.Context) error {
+	_, err := db.Exec(ctx, `
+	CREATE TABLE IF NOT EXISTS users (
+	  id BIGINT PRIMARY KEY,
+	  username TEXT,
+	  first_seen TIMESTAMPTZ DEFAULT now(),
+	  last_seen TIMESTAMPTZ DEFAULT now()
+	);
+	`)
+	return err
+}
+
+// handleWebhook обрабатывает входящие webhook'и
 func handleWebhook(w http.ResponseWriter, r *http.Request) {
 	var update tgbotapi.Update
-	// Декодируем JSON из тела POST-запроса в структуру Update
 	if err := json.NewDecoder(r.Body).Decode(&update); err != nil {
 		log.Printf("Ошибка декодирования обновления: %v", err)
-		http.Error(w, "Bad Request", http.StatusBadRequest)
+		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
-
-	// Обрабатываем обновление в отдельной горутине, чтобы не блокировать обработку следующих запросов
 	go processUpdate(update)
-
-	// Отвечаем Telegram, что запрос принят (обычно 200 OK достаточно)
 	w.WriteHeader(http.StatusOK)
 }
 
-// processUpdate - это логика обработки одного обновления (перенос из цикла for)
+// processUpdate обрабатывает одно обновление
 func processUpdate(update tgbotapi.Update) {
-	// Предполагая, что вы хотите сохранять пользователей
-	// ВАЖНО: loadUsers() был отключен, поэтому uniqueUsers будет пустым при перезапуске
-	// если вы снова включите loadUsers, убедитесь, что saveUsers работает корректно
-	// с учетом эфемерной файловой системы Render.
-	countUniqueUsers(bot, update)
-
-	// Обработка команды /start
-	if update.Message != nil && update.Message.IsCommand() && update.Message.Command() == "start" {
-		log.Printf("Пользователь %d запросил /start", update.Message.Chat.ID)
-		sendStartMessage(bot, update.Message.Chat.ID)
-	} else if update.Message != nil {
-		// Обработка текстовых сообщений (кнопок)
-		switch update.Message.Text {
-		case "Расписание А":
-			log.Printf("Пользователь %d запросил расписание А", update.Message.Chat.ID)
-			sendSchedule(bot, update.Message.Chat.ID, "A")
-		case "Расписание Б":
-			log.Printf("Пользователь %d запросил расписание Б", update.Message.Chat.ID)
-			sendSchedule(bot, update.Message.Chat.ID, "B")
-		case "Поддержка и предложения":
-			log.Printf("Пользователь %d запросил поддержку/предложения", update.Message.Chat.ID)
-			sendSupportMessage(bot, update.Message.Chat.ID)
+	// Сохраняем/обновляем пользователя в БД
+	if update.Message != nil && update.Message.From != nil {
+		if err := saveUserFromUpdate(update); err != nil {
+			log.Printf("saveUserFromUpdate err: %v", err)
 		}
 	}
-	// ... обработка других типов обновлений (CallbackQuery и т.д., если нужно) ...
+
+	// Обработка команд/текстовых сообщений (копируйте вашу логику)
+	if update.Message != nil && update.Message.IsCommand() && update.Message.Command() == "start" {
+		sendStartMessage(update.Message.Chat.ID)
+	} else if update.Message != nil && update.Message.Text != "" {
+		switch update.Message.Text {
+		case "Расписание А":
+			sendSchedule(update.Message.Chat.ID, "A")
+		case "Расписание Б":
+			sendSchedule(update.Message.Chat.ID, "B")
+		case "Поддержка и предложения":
+			sendSupportMessage(update.Message.Chat.ID)
+		default:
+			// Можно отправить подсказку
+			msg := tgbotapi.NewMessage(update.Message.Chat.ID, "Выберите кнопку на клавиатуре или напишите команду /start")
+			bot.Send(msg)
+		}
+	}
 }
 
-// scrapeImages парсит страницу и обновляет расписания для корпусов А и Б
+// saveUserFromUpdate сохраняет/обновляет пользователя в таблице users
+func saveUserFromUpdate(update tgbotapi.Update) error {
+	if update.Message == nil || update.Message.From == nil {
+		return nil
+	}
+	userId := int64(update.Message.From.ID)
+	username := update.Message.From.UserName
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	_, err := db.Exec(ctx, `
+	INSERT INTO users (id, username, first_seen, last_seen)
+	VALUES ($1, $2, now(), now())
+	ON CONFLICT (id) DO UPDATE SET username = EXCLUDED.username, last_seen = now();
+	`, userId, username)
+	if err != nil {
+		return fmt.Errorf("db exec: %w", err)
+	}
+	log.Printf("User saved: %d (%s)", userId, username)
+	return nil
+}
+
+// --- Скрейпер (взято и адаптировано из вашего примера) ---
+const (
+	baseSiteURL = "https://kmtko.my1.ru" // поменяйте, если нужно
+	targetPath  = "/index/raspisanie_zanjatij_ochno/0-403"
+)
+
 func scrapeImages() {
 	log.Println("Начинаем скрапинг...")
 
-	// Очищаем старые данные
+	// очищаем старые данные
 	mu.Lock()
 	scheduleA = make(map[string]time.Time)
 	scheduleB = make(map[string]time.Time)
-	log.Println("Очищаем старые данные расписаний")
 	mu.Unlock()
+	log.Println("Старые данные расписаний очищены")
 
 	c := colly.NewCollector()
 
-	// Ищем все изображения расписания по паттерну в src
 	c.OnHTML(`img[src*="/1Raspisanie/"]`, func(e *colly.HTMLElement) {
 		imageSrc := e.Attr("src")
 		altText := e.Attr("alt")
-		log.Printf("Найдено изображение расписания: src='%s', alt='%s'", imageSrc, altText)
+		log.Printf("Найдено изображение: src=%s alt=%s", imageSrc, altText)
 
-		// Извлекаем информацию из пути к файлу
-		// Паттерн: /1Raspisanie/DD.MM[_YYYY]_korpus_[a|v].jpg
-		// Год в названии файла игнорируется, всегда используется текущий год
-		// Исправлено: Добавлено \.jpe?g в регулярное выражение, чтобы охватить и .jpeg
 		re := regexp.MustCompile(`/1Raspisanie/(\d{1,2})\.(\d{1,2})(?:\.\d{4})?_korpus_([av])\.jpe?g$`)
 		matches := re.FindStringSubmatch(imageSrc)
-
 		if len(matches) != 4 {
-			log.Printf("URL изображения не соответствует ожидаемому формату: %s", imageSrc)
+			log.Printf("URL не соответствует формату: %s", imageSrc)
 			return
 		}
 
-		dayStr := matches[1]   // "5" или "05"
-		monthStr := matches[2] // "9" или "09"
-		corpusLetter := strings.ToLower(matches[3]) // "a" или "v"
+		dayStr := matches[1]
+		monthStr := matches[2]
+		corpusLetter := strings.ToLower(matches[3])
 
-		// Парсим день и месяц
 		day, errD := strconv.Atoi(dayStr)
 		month, errM := strconv.Atoi(monthStr)
 		if errD != nil || errM != nil {
-			log.Printf("Ошибка при парсинге дня или месяца из '%s.%s': %v, %v", dayStr, monthStr, errD, errM)
+			log.Printf("Ошибка парсинга даты: %v %v", errD, errM)
 			return
 		}
 
-		// Создаем дату с текущим годом
 		now := time.Now()
-		loc := time.Local // Или time.FixedZone("MSK", 3*60*60)
-		// time.Date(год, месяц, день, час, минута, секунда, наносекунда, локация)
+		loc := time.Local
 		imageDate := time.Date(now.Year(), time.Month(month), day, 0, 0, 0, 0, loc)
 
-		// Формируем абсолютный URL
-		// Исправлено: Убраны лишние пробелы из baseURL
-		baseURL := "https://kmtko.my1.ru"
 		if !strings.HasPrefix(imageSrc, "/") {
 			imageSrc = "/" + imageSrc
 		}
-		// Исправлено: Правильное формирование URL без лишних пробелов
-		fullImageURL := strings.TrimRight(baseURL, "/") + imageSrc
+		fullURL := strings.TrimRight(baseSiteURL, "/") + imageSrc
 
-		// Определяем корпус и сохраняем
 		mu.Lock()
 		if corpusLetter == "a" {
-			scheduleA[fullImageURL] = imageDate
-			log.Printf("Добавлено/обновлено расписание корпуса А: %s (дата: %v)", fullImageURL, imageDate.Format("2006-01-02"))
-		} else if corpusLetter == "v" { // Исправлено: 'v' для корпуса "В"
-			scheduleB[fullImageURL] = imageDate
-			log.Printf("Добавлено/обновлено расписание корпуса Б: %s (дата: %v)", fullImageURL, imageDate.Format("2006-01-02"))
-		} else {
-			log.Printf("Неизвестный корпус '%s' в URL: %s", corpusLetter, fullImageURL)
+			scheduleA[fullURL] = imageDate
+			log.Printf("Добавлено расписание A: %s (%s)", fullURL, imageDate.Format("2006-01-02"))
+		} else if corpusLetter == "v" {
+			scheduleB[fullURL] = imageDate
+			log.Printf("Добавлено расписание B: %s (%s)", fullURL, imageDate.Format("2006-01-02"))
 		}
 		mu.Unlock()
 	})
 
 	c.OnRequest(func(r *colly.Request) {
-		log.Printf("Посещаем страницу: %s", r.URL.String())
+		log.Printf("Visiting %s", r.URL.String())
 	})
-
 	c.OnError(func(r *colly.Response, err error) {
-		log.Printf("Ошибка при запросе %s: %v", r.Request.URL, err)
+		log.Printf("Colly error: %v (url=%s)", err, r.Request.URL.String())
 	})
 
-	// Исправлено: Обработка ошибки от Visit
-	err := c.Visit(url)
+	err := c.Visit(baseSiteURL + targetPath)
 	if err != nil {
-		log.Printf("Ошибка при посещении страницы: %v", err)
+		log.Printf("Ошибка Visit: %v", err)
 		return
 	}
 
-	// Логируем содержимое после скрапинга
 	mu.RLock()
-	log.Printf("Скрапинг завершён. Найдено расписаний: А - %d, Б - %d", len(scheduleA), len(scheduleB))
+	log.Printf("Скрапинг завершён. A=%d B=%d", len(scheduleA), len(scheduleB))
 	mu.RUnlock()
 }
 
-// sendSchedule отправляет пользователю изображения расписания для указанного корпуса
-func sendSchedule(bot *tgbotapi.BotAPI, chatID int64, corpus string) {
+// sendSchedule отправляет все найденные изображения указанного корпуса
+func sendSchedule(chatID int64, corpus string) {
 	var scheduleMap map[string]time.Time
 	var corpusName string
 
@@ -253,7 +310,7 @@ func sendSchedule(bot *tgbotapi.BotAPI, chatID int64, corpus string) {
 	case "A":
 		scheduleMap = scheduleA
 		corpusName = "корпуса А"
-	case "B": // Исправлено: 'B' для корпуса "Б"
+	case "B":
 		scheduleMap = scheduleB
 		corpusName = "корпуса Б"
 	default:
@@ -263,170 +320,49 @@ func sendSchedule(bot *tgbotapi.BotAPI, chatID int64, corpus string) {
 	}
 
 	mu.RLock()
-	defer mu.RUnlock()
-
 	if len(scheduleMap) == 0 {
+		mu.RUnlock()
 		msg := tgbotapi.NewMessage(chatID, fmt.Sprintf("Расписание для %s не найдено.", corpusName))
 		bot.Send(msg)
-		log.Printf("Для чата %d расписание %s не найдено", chatID, corpusName)
 		return
 	}
 
-	// Отправляем все найденные изображения для этого корпуса
-	for imageURL, imageDate := range scheduleMap {
-		log.Printf("Отправляем изображение %s пользователю %d", imageURL, chatID)
-		sendImageToTelegram(bot, chatID, imageURL, imageDate)
+	// отправляем (по одному фото на сообщение)
+	for url, date := range scheduleMap {
+		// Форматируем дату для описания
+		caption := fmt.Sprintf("Расписание на %02d.%02d (примерно)", date.Day(), date.Month())
+		photo := tgbotapi.NewPhoto(chatID, tgbotapi.FileURL(url))
+		photo.Caption = caption
+		if _, err := bot.Send(photo); err != nil {
+			log.Printf("Ошибка отправки фото %s: %v", url, err)
+		} else {
+			log.Printf("Отправлено фото %s -> chat %d", url, chatID)
+		}
 	}
+	mu.RUnlock()
 }
 
-// sendImageToTelegram отправляет одно изображение в Telegram
-func sendImageToTelegram(bot *tgbotapi.BotAPI, chatID int64, imageURL string, imageDate time.Time) {
-	// Локализация дней недели и месяцев
-	daysOfWeek := map[time.Weekday]string{
-		time.Monday:    "Понедельник",
-		time.Tuesday:   "Вторник",
-		time.Wednesday: "Среда",
-		time.Thursday:  "Четверг",
-		time.Friday:    "Пятница",
-		time.Saturday:  "Суббота",
-		time.Sunday:    "Воскресенье",
-	}
-	months := map[time.Month]string{
-		time.January:   "января",
-		time.February:  "февраля",
-		time.March:     "марта",
-		time.April:     "апреля",
-		time.May:       "мая",
-		time.June:      "июня",
-		time.July:      "июля",
-		time.August:    "августа",
-		time.September: "сентября",
-		time.October:   "октября",
-		time.November:  "ноября",
-		time.December:  "декабря",
-	}
-
-	// Форматируем дату красиво, включая день недели
-	var dateStr string
-	weekdayStr := daysOfWeek[imageDate.Weekday()]
-
-	// Всегда показываем дату в текущем году
-	dateStr = fmt.Sprintf("%s, %d %s", weekdayStr, imageDate.Day(), months[imageDate.Month()])
-
-	// Исправлено: Используем NewPhoto с FileURL для v5
-	msg := tgbotapi.NewPhoto(chatID, tgbotapi.FileURL(imageURL))
-	msg.Caption = fmt.Sprintf("Расписание на %s", dateStr)
-	_, err := bot.Send(msg)
-	if err != nil {
-		log.Printf("Ошибка при отправке изображения в чат %d (URL: %s): %v", chatID, imageURL, err)
-	} else {
-		log.Printf("Изображение %s успешно отправлено пользователю %d", imageURL, chatID)
-	}
-}
-
-// sendStartMessage отправляет приветственное сообщение с клавиатурой
-func sendStartMessage(bot *tgbotapi.BotAPI, chatID int64) {
-	msg := tgbotapi.NewMessage(chatID, "Привет! Я бот, который отправляет изображения расписания.")
-
-	// Создание клавиатуры с кнопками
-	// Размещаем кнопки в две строки
+// sendStartMessage отправляет клавиатуру
+func sendStartMessage(chatID int64) {
+	msg := tgbotapi.NewMessage(chatID, "Привет! Выберите расписание:")
 	keyboard := tgbotapi.NewReplyKeyboard(
 		tgbotapi.NewKeyboardButtonRow(
 			tgbotapi.NewKeyboardButton("Расписание А"),
 			tgbotapi.NewKeyboardButton("Расписание Б"),
 		),
 		tgbotapi.NewKeyboardButtonRow(
-			tgbotapi.NewKeyboardButton("Поддержка и предложения"), // Новая кнопка
+			tgbotapi.NewKeyboardButton("Поддержка и предложения"),
 		),
 	)
 	msg.ReplyMarkup = keyboard
-
-	_, err := bot.Send(msg)
-	if err != nil {
-		log.Printf("Ошибка при отправке стартового сообщения: %v", err)
-	} else {
-		log.Printf("Стартовое сообщение успешно отправлено пользователю %d", chatID)
+	if _, err := bot.Send(msg); err != nil {
+		log.Printf("sendStartMessage err: %v", err)
 	}
 }
 
-// sendSupportMessage отправляет пользователю информацию о поддержке
-func sendSupportMessage(bot *tgbotapi.BotAPI, chatID int64) {
-	// Отправляем сообщение с юзернеймом поддержки
-	msg := tgbotapi.NewMessage(chatID, "По вопросам поддержки и предложений обращайтесь к @podkmt")
-	_, err := bot.Send(msg)
-	if err != nil {
-		log.Printf("Ошибка при отправке сообщения поддержки пользователю %d: %v", chatID, err)
-	} else {
-		log.Printf("Сообщение поддержки успешно отправлено пользователю %d", chatID)
+func sendSupportMessage(chatID int64) {
+	msg := tgbotapi.NewMessage(chatID, "По вопросам поддержки: @podkmt")
+	if _, err := bot.Send(msg); err != nil {
+		log.Printf("sendSupportMessage err: %v", err)
 	}
-}
-
-// --- Функции для работы с пользователями ---
-// (Функции loadUsers, saveUsers, countUniqueUsers остаются без изменений)
-// ВАЖНО: loadUsers() был отключен ранее. Если вы снова его включите,
-// помните о проблеме с эфемерной файловой системой Render.
-func loadUsers() {
-	data, err := ioutil.ReadFile("USER1.TXT")
-	if err != nil {
-		if os.IsNotExist(err) {
-			log.Println("Файл USER1.TXT не найден, будет создан новый.")
-			return
-		}
-		log.Printf("Ошибка при чтении файла USER1.TXT: %v", err)
-		return
-	}
-
-	lines := strings.Split(string(data), "\n")
-	for _, line := range lines {
-		if line == "" {
-			continue
-		}
-		parts := strings.Split(line, ":")
-		if len(parts) != 2 {
-			log.Printf("Некорректная строка в файле USER1.TXT: %s", line)
-			continue
-		}
-		userId, err := strconv.ParseInt(parts[0], 10, 64)
-		if err != nil {
-			log.Printf("Некорректный айди пользователя в файле USER1.TXT: %s", parts[0])
-			continue
-		}
-		uniqueUsers[userId] = parts[1]
-	}
-	log.Printf("Загружено %d уникальных пользователей из USER1.TXT", len(uniqueUsers))
-}
-
-func saveUsers() {
-	data := ""
-	for userId, username := range uniqueUsers {
-		data += fmt.Sprintf("%d:%s\n", userId, username)
-	}
-	err := ioutil.WriteFile("USER1.TXT", []byte(data), 0644)
-	if err != nil {
-		log.Printf("Ошибка при записи файла USER1.TXT: %v", err)
-	} else {
-		log.Printf("Файл USER1.TXT успешно сохранен с %d пользователями.", len(uniqueUsers))
-	}
-}
-
-func countUniqueUsers(bot *tgbotapi.BotAPI, update tgbotapi.Update) {
-	if update.Message == nil || update.Message.From == nil {
-		return // Игнорируем обновления без сообщения или пользователя
-	}
-	userId := int64(update.Message.From.ID)
-	username := update.Message.From.UserName
-	mu.Lock()
-	if _, ok := uniqueUsers[userId]; !ok {
-		uniqueUsers[userId] = username
-		log.Printf("Новый пользователь добавлен: ID=%d, Username=%s", userId, username)
-		saveUsers() // Сохраняем при добавлении нового пользователя
-	} else {
-		// Опционально: обновляем имя пользователя, если оно изменилось
-		if uniqueUsers[userId] != username {
-			uniqueUsers[userId] = username
-			log.Printf("Имя пользователя обновлено: ID=%d, Username=%s", userId, username)
-			saveUsers()
-		}
-	}
-	mu.Unlock()
 }
