@@ -107,7 +107,7 @@ func main() {
 	go func() {
 		for {
 			scrapeImages()
-			time.Sleep(2 * time.Hour) // интервал сканирования
+			time.Sleep(30 * time.Minute) // интервал сканирования
 		}
 	}()
 
