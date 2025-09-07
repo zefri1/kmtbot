@@ -94,10 +94,6 @@ func main() {
 	if err != nil {
 		log.Fatalf("Ошибка при установке вебхука: %v", err)
 	}
-
-	if err != nil {
-		log.Fatalf("Ошибка при установке вебхука: %v", err)
-	}
 	log.Printf("Вебхук установлен на: %s", webhookURL)
 
 	// Запускаем pprof (локально доступен на :6060 если вы захотите изменить)
@@ -180,7 +176,7 @@ func processUpdate(update tgbotapi.Update) {
 		}
 	}
 
-	// Обработка команд/текстовых сообщений (копируйте вашу логику)
+	// Обработка команд/текстовых сообщений
 	if update.Message != nil && update.Message.IsCommand() && update.Message.Command() == "start" {
 		sendStartMessage(update.Message.Chat.ID)
 	} else if update.Message != nil && update.Message.Text != "" {
@@ -222,23 +218,42 @@ func saveUserFromUpdate(update tgbotapi.Update) error {
 	return nil
 }
 
-// --- Скрейпер (взято и адаптировано из вашего примера) ---
+// --- Скрейпер ---
 const (
-	baseSiteURL = "https://kmtko.my1.ru" // поменяйте, если нужно
+	baseSiteURL = "https://kmtko.my1.ru"
 	targetPath  = "/index/raspisanie_zanjatij_ochno/0-403"
 )
 
 func scrapeImages() {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("Паника в скрапере: %v", r)
+		}
+	}()
+
+	//ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	//defer cancel()
+
+	start := time.Now()
 	log.Println("Начинаем скрапинг...")
 
-	// очищаем старые данные
+	// Создаем копию коллектора с таймаутами
+	c := colly.NewCollector(
+		colly.Async(true),
+	)
+	c.SetRequestTimeout(30 * time.Second)
+	c.Limit(&colly.LimitRule{
+		DomainGlob:  "*",
+		Parallelism: 2,
+		RandomDelay: 1 * time.Second,
+	})
+
+	// Очищаем старые данные
 	mu.Lock()
 	scheduleA = make(map[string]time.Time)
 	scheduleB = make(map[string]time.Time)
 	mu.Unlock()
 	log.Println("Старые данные расписаний очищены")
-
-	c := colly.NewCollector()
 
 	c.OnHTML(`img[src*="/1Raspisanie/"]`, func(e *colly.HTMLElement) {
 		imageSrc := e.Attr("src")
@@ -296,9 +311,21 @@ func scrapeImages() {
 		return
 	}
 
+	// Ждём завершения всех асинхронных запросов
+	c.Wait()
+
 	mu.RLock()
-	log.Printf("Скрапинг завершён. A=%d B=%d", len(scheduleA), len(scheduleB))
+	log.Printf("Скрапинг завершён. A=%d B=%d. Занял: %v", len(scheduleA), len(scheduleB), time.Since(start))
 	mu.RUnlock()
+}
+
+// copyMap возвращает независимую копию map
+func copyMap(src map[string]time.Time) map[string]time.Time {
+	dst := make(map[string]time.Time, len(src))
+	for k, v := range src {
+		dst[k] = v
+	}
+	return dst
 }
 
 // sendSchedule отправляет все найденные изображения указанного корпуса
@@ -308,10 +335,8 @@ func sendSchedule(chatID int64, corpus string) {
 
 	switch strings.ToUpper(corpus) {
 	case "A":
-		scheduleMap = scheduleA
 		corpusName = "корпуса А"
 	case "B":
-		scheduleMap = scheduleB
 		corpusName = "корпуса Б"
 	default:
 		msg := tgbotapi.NewMessage(chatID, "Неизвестный корпус.")
@@ -319,17 +344,24 @@ func sendSchedule(chatID int64, corpus string) {
 		return
 	}
 
+	// --- Ключевое исправление: Копируем данные и сразу отпускаем мьютекс ---
 	mu.RLock()
+	if strings.ToUpper(corpus) == "A" {
+		scheduleMap = copyMap(scheduleA)
+	} else {
+		scheduleMap = copyMap(scheduleB)
+	}
+	mu.RUnlock()
+	// --- Теперь работаем с КОПИЕЙ, не блокируя скрапер ---
+
 	if len(scheduleMap) == 0 {
-		mu.RUnlock()
 		msg := tgbotapi.NewMessage(chatID, fmt.Sprintf("Расписание для %s не найдено.", corpusName))
 		bot.Send(msg)
 		return
 	}
 
-	// отправляем (по одному фото на сообщение)
+	// Отправляем изображения из копии
 	for url, date := range scheduleMap {
-		// Форматируем дату для описания
 		caption := fmt.Sprintf("Расписание на %02d.%02d ", date.Day(), date.Month())
 		photo := tgbotapi.NewPhoto(chatID, tgbotapi.FileURL(url))
 		photo.Caption = caption
@@ -339,7 +371,6 @@ func sendSchedule(chatID int64, corpus string) {
 			log.Printf("Отправлено фото %s -> chat %d", url, chatID)
 		}
 	}
-	mu.RUnlock()
 }
 
 // sendStartMessage отправляет клавиатуру
