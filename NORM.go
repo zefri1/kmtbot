@@ -24,6 +24,8 @@ const (
 	webhookPath = "/webhook"
 	baseSiteURL = "https://kmtko.my1.ru"
 	targetPath  = "/index/raspisanie_zanjatij_ochno/0-403"
+	// ID чата администратора для загрузки файлов
+	adminChatID = 6436017953
 )
 
 // ScheduleItem хранит информацию о расписании, включая file_id
@@ -318,26 +320,38 @@ func scrapeImages() {
 	// Функция для загрузки и получения file_id
 	uploadAndGetFileID := func(item *ScheduleItem) string {
 		// Генерируем уникальный URL для загрузки (чтобы Telegram не использовал свой кэш)
-		uploadURL := fmt.Sprintf("%s?upload_cache_bust=%d", item.URL, time.Now().UnixNano())
-		
-		// Создаем фото для отправки боту самому себе
-		photo := tgbotapi.NewPhoto(bot.Self.ID, tgbotapi.FileURL(uploadURL))
-		photo.DisableNotification = true // Не уведомлять бота о сообщении
+		uploadURL := fmt.Sprintf("%s?upload_cache_bust_scrape=%d", item.URL, time.Now().UnixNano())
+		log.Printf("DEBUG: Попытка загрузки %s (уникальный URL: %s) в чат %d", item.URL, uploadURL, adminChatID)
+
+		// Создаем фото для отправки в чат администратора
+		photo := tgbotapi.NewPhoto(adminChatID, tgbotapi.FileURL(uploadURL))
+		photo.DisableNotification = true // Не уведомлять администратора о сообщении
+		photo.Caption = fmt.Sprintf("[Кэширование] %s", item.URL) // Добавляем подпись для идентификации
 
 		msg, err := bot.Send(photo)
 		if err != nil {
 			log.Printf("Ошибка загрузки фото в Telegram (для кэширования) %s: %v", item.URL, err)
 			return "" // Возвращаем пустую строку в случае ошибки
 		}
-		
+
+		log.Printf("DEBUG: Сообщение с фото отправлено в Telegram, MessageID: %d", msg.MessageID)
+		log.Printf("DEBUG: Длина msg.Photo: %d", len(msg.Photo))
+
 		// Получаем file_id из отправленного сообщения
 		if len(msg.Photo) > 0 {
 			// Берем фото с наилучшим качеством (обычно последний элемент)
 			fileID := msg.Photo[len(msg.Photo)-1].FileID
 			log.Printf("Загружено и закэшировано фото %s -> FileID: %s", item.URL, fileID)
+			// Пытаемся удалить сообщение, чтобы не засорять чат администратора
+			// _, delErr := bot.Send(tgbotapi.NewDeleteMessage(adminChatID, msg.MessageID))
+			// if delErr != nil {
+			// 	log.Printf("Предупреждение: Не удалось удалить сообщение %d: %v", msg.MessageID, delErr)
+			// } else {
+			// 	log.Printf("DEBUG: Сообщение %d удалено из чата администратора", msg.MessageID)
+			// }
 			return fileID
 		} else {
-			log.Printf("Ошибка: Сообщение с фото не содержит фото %s", item.URL)
+			log.Printf("Ошибка: Сообщение с фото не содержит фото %s. Ответ от Telegram: %+v", item.URL, msg)
 			return ""
 		}
 	}
@@ -346,13 +360,13 @@ func scrapeImages() {
 	for _, item := range tempScheduleA {
 		item.FileID = uploadAndGetFileID(item)
 		// Небольшая задержка между загрузками, чтобы не перегружать Telegram API
-		time.Sleep(50 * time.Millisecond) // Уменьшена задержка
+		time.Sleep(100 * time.Millisecond)
 	}
 
 	// Загружаем изображения для корпуса B
 	for _, item := range tempScheduleB {
 		item.FileID = uploadAndGetFileID(item)
-		time.Sleep(50 * time.Millisecond) // Уменьшена задержка
+		time.Sleep(100 * time.Millisecond)
 	}
 
 	log.Printf("Загрузка изображений завершена за %v", time.Since(uploadStart))
