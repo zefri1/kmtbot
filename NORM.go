@@ -7,9 +7,10 @@ import (
 	"log"
 	"math/rand"
 	"net/http"
-	_ "net/http/pprof" // включаем pprof на /debug/pprof/ (локально)
+	_ "net/http/pprof"
 	"os"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -28,15 +29,13 @@ var (
 	bot       *tgbotapi.BotAPI
 	db        *pgxpool.Pool
 	mu        sync.RWMutex
-	scheduleA = make(map[string]time.Time) // URL -> date
+	scheduleA = make(map[string]time.Time) // URL -> date (day+month, year may be ignored)
 	scheduleB = make(map[string]time.Time)
 )
 
 func main() {
-	// инициализация случайности для джиттера
 	rand.Seed(time.Now().UnixNano())
 
-	// Читаем переменные окружения
 	telegramToken := os.Getenv("TELEGRAM_TOKEN")
 	if telegramToken == "" {
 		log.Fatal("TELEGRAM_TOKEN не задан. Установите переменную окружения.")
@@ -46,7 +45,6 @@ func main() {
 		log.Fatal("DATABASE_URL не задан. Установите переменную окружения.")
 	}
 
-	// Инициализируем пул Postgres
 	ctx := context.Background()
 	cfg, err := pgxpool.ParseConfig(databaseURL)
 	if err != nil {
@@ -71,14 +69,12 @@ func main() {
 		log.Fatalf("ensureUsersTable: %v", err)
 	}
 
-	// Инициализируем Telegram Bot API
 	bot, err = tgbotapi.NewBotAPI(telegramToken)
 	if err != nil {
 		log.Fatalf("Ошибка при создании бота: %v", err)
 	}
 	log.Printf("Авторизован как: %s", bot.Self.UserName)
 
-	// Настройка вебхука
 	externalURL := os.Getenv("RENDER_EXTERNAL_URL")
 	if externalURL == "" {
 		externalURL = "http://localhost:8080"
@@ -96,13 +92,12 @@ func main() {
 	}
 	log.Printf("Вебхук установлен на: %s", webhookURL)
 
-	// pprof (локально)
 	go func() {
 		log.Println("pprof слушает на :6060 (локально)")
 		log.Fatal(http.ListenAndServe(":6060", nil))
 	}()
 
-	// Запускаем скрейпер в фоне (интервал сканирования оставил - 30 минут)
+	// Скрейпер
 	go func() {
 		for {
 			scrapeImages()
@@ -110,10 +105,9 @@ func main() {
 		}
 	}()
 
-	// Self-ping (keep-alive) — каждые ~3 минуты с джиттером ±30s
+	// keep-alive (3мин ±30с)
 	go keepAlive(externalURL)
 
-	// HTTP handlers
 	http.HandleFunc(webhookPath, handleWebhook)
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/" {
@@ -123,7 +117,6 @@ func main() {
 		}
 		http.NotFound(w, r)
 	})
-	// health endpoint
 	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
 		defer cancel()
@@ -148,7 +141,6 @@ func keepAlive(externalURL string) {
 	client := &http.Client{Timeout: 5 * time.Second}
 	base := 3 * time.Minute
 	for {
-		// вычисляем джиттер в пределах ±30 секунд
 		j := time.Duration(rand.Intn(61)-30) * time.Second
 		interval := base + j
 		url := strings.TrimRight(externalURL, "/") + "/health"
@@ -160,12 +152,10 @@ func keepAlive(externalURL string) {
 			resp.Body.Close()
 			log.Printf("keepAlive: ping %s -> %d (next in %v)", url, resp.StatusCode, interval)
 		}
-
 		time.Sleep(interval)
 	}
 }
 
-// ensureUsersTable создаёт таблицу users, если её нет
 func ensureUsersTable(ctx context.Context) error {
 	_, err := db.Exec(ctx, `
 	CREATE TABLE IF NOT EXISTS users (
@@ -190,14 +180,12 @@ func handleWebhook(w http.ResponseWriter, r *http.Request) {
 }
 
 func processUpdate(update tgbotapi.Update) {
-	// Сохраняем/обновляем пользователя в БД
 	if update.Message != nil && update.Message.From != nil {
 		if err := saveUserFromUpdate(update); err != nil {
 			log.Printf("saveUserFromUpdate err: %v", err)
 		}
 	}
 
-	// Обработка команд/текстовых сообщений
 	if update.Message != nil && update.Message.IsCommand() && update.Message.Command() == "start" {
 		sendStartMessage(update.Message.Chat.ID)
 	} else if update.Message != nil && update.Message.Text != "" {
@@ -246,26 +234,21 @@ const (
 func scrapeImages() {
 	defer func() {
 		if r := recover(); r != nil {
-			log.Printf("Паника в скрапере: %v", r)
+			log.Printf("Паника в скраperе: %v", r)
 		}
 	}()
 
 	start := time.Now()
 	log.Println("Начинаем скрапинг...")
 
-	// Создаем копию коллектора с убранными искусственными задержками
-	c := colly.NewCollector(
-		colly.Async(true),
-	)
+	c := colly.NewCollector(colly.Async(true))
 	c.SetRequestTimeout(30 * time.Second)
-	// Убираем RandomDelay, оставляем разумную параллельность
 	c.Limit(&colly.LimitRule{
 		DomainGlob:  "*",
 		Parallelism: 4,
 		RandomDelay: 0,
 	})
 
-	// Очищаем старые данные
 	mu.Lock()
 	scheduleA = make(map[string]time.Time)
 	scheduleB = make(map[string]time.Time)
@@ -341,6 +324,19 @@ func copyMap(src map[string]time.Time) map[string]time.Time {
 	return dst
 }
 
+var weekdayRus = map[time.Weekday]string{
+	time.Monday:    "Понедельник",
+	time.Tuesday:   "Вторник",
+	time.Wednesday: "Среда",
+	time.Thursday:  "Четверг",
+	time.Friday:    "Пятница",
+	time.Saturday:  "Суббота",
+	time.Sunday:    "Воскресенье",
+}
+
+// sendSchedule: отправляет фото по дате (старые -> новые).
+// Первое фото отправляется сразу, между сообщениями минимальная пауза (~150ms).
+// Подпись: "Понедельник — 02.03.2025"
 func sendSchedule(chatID int64, corpus string) {
 	var scheduleMap map[string]time.Time
 	var corpusName string
@@ -356,6 +352,7 @@ func sendSchedule(chatID int64, corpus string) {
 		return
 	}
 
+	// Копируем под мьютексом
 	mu.RLock()
 	if strings.ToUpper(corpus) == "A" {
 		scheduleMap = copyMap(scheduleA)
@@ -370,15 +367,50 @@ func sendSchedule(chatID int64, corpus string) {
 		return
 	}
 
-	for url, date := range scheduleMap {
-		caption := fmt.Sprintf("Расписание на %02d.%02d", date.Day(), int(date.Month()))
-		uniqueURL := fmt.Sprintf("%s?cb=%d", url, time.Now().UnixNano())
+	// Собираем и сортируем по дате (old->new)
+	type item struct {
+		url  string
+		date time.Time
+	}
+	items := make([]item, 0, len(scheduleMap))
+	for u, d := range scheduleMap {
+		items = append(items, item{url: u, date: d})
+	}
+	sort.Slice(items, func(i, j int) bool {
+		if items[i].date.Equal(items[j].date) {
+			return items[i].url < items[j].url
+		}
+		return items[i].date.Before(items[j].date)
+	})
+
+	// Интервал между отправками: примерно 150ms ±20ms
+	baseInterval := 150 * time.Millisecond
+	jitterRange := 40 * time.Millisecond // ±20ms
+
+	for idx, it := range items {
+		// Формируем подпись с днём недели для 2025 года
+		weekdayDate := time.Date(2025, it.date.Month(), it.date.Day(), 0, 0, 0, 0, time.Local)
+		wname := weekdayRus[weekdayDate.Weekday()]
+		caption := fmt.Sprintf("%s — %02d.%02d.2025", wname, it.date.Day(), int(it.date.Month()))
+
+		uniqueURL := fmt.Sprintf("%s?cb=%d", it.url, time.Now().UnixNano())
 		photo := tgbotapi.NewPhoto(chatID, tgbotapi.FileURL(uniqueURL))
 		photo.Caption = caption
+
 		if _, err := bot.Send(photo); err != nil {
-			log.Printf("Ошибка отправки фото %s: %v", url, err)
+			log.Printf("Ошибка отправки фото %s: %v", it.url, err)
 		} else {
-			log.Printf("Отправлено фото %s -> chat %d", url, chatID)
+			log.Printf("Отправлено фото %s -> chat %d (%s)", it.url, chatID, caption)
+		}
+
+		// Никакой паузы после последнего сообщения
+		if idx < len(items)-1 {
+			j := time.Duration(rand.Int63n(int64(jitterRange))) - jitterRange/2
+			interval := baseInterval + j
+			if interval < 50*time.Millisecond {
+				interval = 50 * time.Millisecond
+			}
+			time.Sleep(interval)
 		}
 	}
 }
