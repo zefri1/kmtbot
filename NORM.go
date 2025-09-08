@@ -22,6 +22,8 @@ import (
 
 const (
 	webhookPath = "/webhook"
+	baseSiteURL = "https://kmtko.my1.ru"
+	targetPath  = "/index/raspisanie_zanjatij_ochno/0-403"
 )
 
 var (
@@ -50,7 +52,6 @@ func main() {
 	cfg.MaxConns = 10
 	cfg.MinConns = 1
 	cfg.MaxConnLifetime = 30 * time.Minute
-
 	db, err = pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
 		log.Fatalf("pgxpool.NewWithConfig: %v", err)
@@ -60,11 +61,9 @@ func main() {
 	if err := db.Ping(ctx); err != nil {
 		log.Fatalf("Не удалось подключиться к БД: %v", err)
 	}
-	log.Println("Подключились к Postgres")
 
-	if err := ensureUsersTable(ctx); err != nil {
-		log.Fatalf("ensureUsersTable: %v", err)
-	}
+	// Таблицы
+	ensureTables(ctx)
 
 	bot, err = tgbotapi.NewBotAPI(telegramToken)
 	if err != nil {
@@ -77,7 +76,6 @@ func main() {
 		externalURL = "http://localhost:8080"
 	}
 	webhookURL := externalURL + webhookPath
-
 	wh, err := tgbotapi.NewWebhook(webhookURL)
 	if err != nil {
 		log.Fatalf("Ошибка при создании webhook: %v", err)
@@ -87,11 +85,10 @@ func main() {
 	}
 	log.Printf("Вебхук установлен: %s", webhookURL)
 
-	go func() {
-		log.Println("pprof слушает на :6060 (локально)")
-		log.Fatal(http.ListenAndServe(":6060", nil))
-	}()
+	// pprof
+	go func() { log.Fatal(http.ListenAndServe(":6060", nil)) }()
 
+	// Скрейпер
 	go func() {
 		for {
 			scrapeImages()
@@ -99,7 +96,7 @@ func main() {
 		}
 	}()
 
-	// self-ping, чтобы Render не засыпал
+	// Self-ping для Render
 	go keepAlive(externalURL)
 
 	http.HandleFunc(webhookPath, handleWebhook)
@@ -126,6 +123,22 @@ func main() {
 	log.Fatal(http.ListenAndServe(":"+port, nil))
 }
 
+func ensureTables(ctx context.Context) {
+	_, _ = db.Exec(ctx, `
+	CREATE TABLE IF NOT EXISTS users (
+	  id BIGINT PRIMARY KEY,
+	  username TEXT,
+	  first_seen TIMESTAMPTZ DEFAULT now(),
+	  last_seen TIMESTAMPTZ DEFAULT now()
+	);
+	CREATE TABLE IF NOT EXISTS user_last_schedule (
+	  user_id BIGINT PRIMARY KEY,
+	  last_day_a DATE,
+	  last_day_b DATE
+	);
+	`)
+}
+
 func keepAlive(url string) {
 	if url == "http://localhost:8080" {
 		return
@@ -142,18 +155,6 @@ func keepAlive(url string) {
 	}
 }
 
-func ensureUsersTable(ctx context.Context) error {
-	_, err := db.Exec(ctx, `
-	CREATE TABLE IF NOT EXISTS users (
-	  id BIGINT PRIMARY KEY,
-	  username TEXT,
-	  first_seen TIMESTAMPTZ DEFAULT now(),
-	  last_seen TIMESTAMPTZ DEFAULT now()
-	);
-	`)
-	return err
-}
-
 func handleWebhook(w http.ResponseWriter, r *http.Request) {
 	var update tgbotapi.Update
 	if err := json.NewDecoder(r.Body).Decode(&update); err != nil {
@@ -166,11 +167,7 @@ func handleWebhook(w http.ResponseWriter, r *http.Request) {
 
 func processUpdate(update tgbotapi.Update) {
 	if update.Message != nil && update.Message.From != nil {
-		go func(up tgbotapi.Update) {
-			if err := saveUserFromUpdate(up); err != nil {
-				log.Printf("saveUserFromUpdate err: %v", err)
-			}
-		}(update)
+		go saveUser(update)
 	}
 	if update.Message != nil && update.Message.IsCommand() && update.Message.Command() == "start" {
 		sendStartMessage(update.Message.Chat.ID)
@@ -183,32 +180,30 @@ func processUpdate(update tgbotapi.Update) {
 		case "Поддержка и предложения":
 			sendSupportMessage(update.Message.Chat.ID)
 		default:
-			msg := tgbotapi.NewMessage(update.Message.Chat.ID, "Выберите кнопку или /start")
-			bot.Send(msg)
+			bot.Send(tgbotapi.NewMessage(update.Message.Chat.ID, "Выберите кнопку или /start"))
 		}
 	}
 }
 
-func saveUserFromUpdate(update tgbotapi.Update) error {
+func saveUser(update tgbotapi.Update) {
 	if update.Message == nil || update.Message.From == nil {
-		return nil
+		return
 	}
+	ctx := context.Background()
 	userId := int64(update.Message.From.ID)
 	username := update.Message.From.UserName
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-	_, err := db.Exec(ctx, `
+	_, _ = db.Exec(ctx, `
 	INSERT INTO users (id, username, first_seen, last_seen)
-	VALUES ($1, $2, now(), now())
-	ON CONFLICT (id) DO UPDATE SET username = EXCLUDED.username, last_seen = now();
+	VALUES ($1,$2,now(),now())
+	ON CONFLICT (id) DO UPDATE SET username=EXCLUDED.username, last_seen=now();
 	`, userId, username)
-	return err
+	// создаём запись для last_schedule, если нет
+	_, _ = db.Exec(ctx, `
+	INSERT INTO user_last_schedule(user_id)
+	VALUES($1)
+	ON CONFLICT DO NOTHING;
+	`, userId)
 }
-
-const (
-	baseSiteURL = "https://kmtko.my1.ru"
-	targetPath  = "/index/raspisanie_zanjatij_ochno/0-403"
-)
 
 func scrapeImages() {
 	defer func() {
@@ -252,9 +247,53 @@ func scrapeImages() {
 	})
 	c.Visit(baseSiteURL + targetPath)
 	c.Wait()
+	log.Printf("Скрапинг завершён, A=%d B=%d за %v", len(scheduleA), len(scheduleB), time.Since(start))
+	notifyNewSchedule()
+}
+
+func notifyNewSchedule() {
+	ctx := context.Background()
 	mu.RLock()
-	log.Printf("Скрапинг завершён. A=%d B=%d. Занял: %v", len(scheduleA), len(scheduleB), time.Since(start))
+	scheduleACopy := copyMap(scheduleA)
+	scheduleBCopy := copyMap(scheduleB)
 	mu.RUnlock()
+
+	var maxA, maxB time.Time
+	for _, d := range scheduleACopy {
+		if d.After(maxA) {
+			maxA = d
+		}
+	}
+	for _, d := range scheduleBCopy {
+		if d.After(maxB) {
+			maxB = d
+		}
+	}
+
+	rows, _ := db.Query(ctx, "SELECT user_id, last_day_a, last_day_b FROM user_last_schedule")
+	defer rows.Close()
+
+	for rows.Next() {
+		var userID int64
+		var lastA, lastB *time.Time
+		rows.Scan(&userID, &lastA, &lastB)
+
+		if maxA.After(getTimeOrZero(lastA)) {
+			bot.Send(tgbotapi.NewMessage(userID, fmt.Sprintf("Появилось новое расписание корпуса А: %02d.%02d.%d", maxA.Day(), maxA.Month(), maxA.Year())))
+			db.Exec(ctx, "UPDATE user_last_schedule SET last_day_a=$1 WHERE user_id=$2", maxA, userID)
+		}
+		if maxB.After(getTimeOrZero(lastB)) {
+			bot.Send(tgbotapi.NewMessage(userID, fmt.Sprintf("Появилось новое расписание корпуса Б: %02d.%02d.%d", maxB.Day(), maxB.Month(), maxB.Year())))
+			db.Exec(ctx, "UPDATE user_last_schedule SET last_day_b=$1 WHERE user_id=$2", maxB, userID)
+		}
+	}
+}
+
+func getTimeOrZero(t *time.Time) time.Time {
+	if t == nil {
+		return time.Time{}
+	}
+	return *t
 }
 
 func copyMap(src map[string]time.Time) map[string]time.Time {
@@ -315,7 +354,6 @@ func sendSchedule(chatID int64, corpus string) {
 	}
 }
 
-
 func sendStartMessage(chatID int64) {
 	msg := tgbotapi.NewMessage(chatID, "Привет! Выберите расписание:")
 	keyboard := tgbotapi.NewReplyKeyboard(
@@ -332,6 +370,5 @@ func sendStartMessage(chatID int64) {
 }
 
 func sendSupportMessage(chatID int64) {
-	msg := tgbotapi.NewMessage(chatID, "По вопросам поддержки: @podkmt")
-	bot.Send(msg)
+	bot.Send(tgbotapi.NewMessage(chatID, "По вопросам поддержки: @podkmt"))
 }
