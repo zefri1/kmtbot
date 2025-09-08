@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"math/rand"
 	"net/http"
 	_ "net/http/pprof" // включаем pprof на /debug/pprof/ (локально)
 	"os"
@@ -23,7 +24,6 @@ const (
 	webhookPath = "/webhook"
 )
 
-// глобальные переменные
 var (
 	bot       *tgbotapi.BotAPI
 	db        *pgxpool.Pool
@@ -33,6 +33,9 @@ var (
 )
 
 func main() {
+	// инициализация случайности для джиттера
+	rand.Seed(time.Now().UnixNano())
+
 	// Читаем переменные окружения
 	telegramToken := os.Getenv("TELEGRAM_TOKEN")
 	if telegramToken == "" {
@@ -49,7 +52,6 @@ func main() {
 	if err != nil {
 		log.Fatalf("pgxpool.ParseConfig: %v", err)
 	}
-	// Рекомендуемые настройки (подберите по своему инстансу)
 	cfg.MaxConns = 10
 	cfg.MinConns = 1
 	cfg.MaxConnLifetime = 30 * time.Minute
@@ -60,13 +62,11 @@ func main() {
 	}
 	defer db.Close()
 
-	// Проверка соединения
 	if err := db.Ping(ctx); err != nil {
 		log.Fatalf("Не удалось подключиться к БД: %v", err)
 	}
 	log.Println("Успешно подключились к Postgres")
 
-	// Простая миграция: создаём таблицу users, если её нет
 	if err := ensureUsersTable(ctx); err != nil {
 		log.Fatalf("ensureUsersTable: %v", err)
 	}
@@ -81,10 +81,10 @@ func main() {
 	// Настройка вебхука
 	externalURL := os.Getenv("RENDER_EXTERNAL_URL")
 	if externalURL == "" {
-		externalURL = "http://localhost:8080" // локально
+		externalURL = "http://localhost:8080"
 		log.Println("RENDER_EXTERNAL_URL не найден, использую localhost (локально).")
 	}
-	webhookURL := externalURL + webhookPath
+	webhookURL := strings.TrimRight(externalURL, "/") + webhookPath
 
 	wh, err := tgbotapi.NewWebhook(webhookURL)
 	if err != nil {
@@ -96,20 +96,22 @@ func main() {
 	}
 	log.Printf("Вебхук установлен на: %s", webhookURL)
 
-	// Запускаем pprof (локально доступен на :6060 если вы захотите изменить)
+	// pprof (локально)
 	go func() {
-		// на Render порт 6060 скорее всего недоступен извне, но локально полезно
 		log.Println("pprof слушает на :6060 (локально)")
 		log.Fatal(http.ListenAndServe(":6060", nil))
 	}()
 
-	// Запускаем скрейпер в фоне
+	// Запускаем скрейпер в фоне (интервал сканирования оставил - 30 минут)
 	go func() {
 		for {
 			scrapeImages()
-			time.Sleep(30 * time.Minute) // интервал сканирования
+			time.Sleep(30 * time.Minute)
 		}
 	}()
+
+	// Self-ping (keep-alive) — каждые ~3 минуты с джиттером ±30s
+	go keepAlive(externalURL)
 
 	// HTTP handlers
 	http.HandleFunc(webhookPath, handleWebhook)
@@ -142,6 +144,27 @@ func main() {
 	log.Fatal(http.ListenAndServe(":"+port, nil))
 }
 
+func keepAlive(externalURL string) {
+	client := &http.Client{Timeout: 5 * time.Second}
+	base := 3 * time.Minute
+	for {
+		// вычисляем джиттер в пределах ±30 секунд
+		j := time.Duration(rand.Intn(61)-30) * time.Second
+		interval := base + j
+		url := strings.TrimRight(externalURL, "/") + "/health"
+
+		resp, err := client.Get(url)
+		if err != nil {
+			log.Printf("keepAlive: ping error: %v", err)
+		} else {
+			resp.Body.Close()
+			log.Printf("keepAlive: ping %s -> %d (next in %v)", url, resp.StatusCode, interval)
+		}
+
+		time.Sleep(interval)
+	}
+}
+
 // ensureUsersTable создаёт таблицу users, если её нет
 func ensureUsersTable(ctx context.Context) error {
 	_, err := db.Exec(ctx, `
@@ -155,7 +178,6 @@ func ensureUsersTable(ctx context.Context) error {
 	return err
 }
 
-// handleWebhook обрабатывает входящие webhook'и
 func handleWebhook(w http.ResponseWriter, r *http.Request) {
 	var update tgbotapi.Update
 	if err := json.NewDecoder(r.Body).Decode(&update); err != nil {
@@ -167,7 +189,6 @@ func handleWebhook(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
-// processUpdate обрабатывает одно обновление
 func processUpdate(update tgbotapi.Update) {
 	// Сохраняем/обновляем пользователя в БД
 	if update.Message != nil && update.Message.From != nil {
@@ -188,14 +209,12 @@ func processUpdate(update tgbotapi.Update) {
 		case "Поддержка и предложения":
 			sendSupportMessage(update.Message.Chat.ID)
 		default:
-			// Можно отправить подсказку
 			msg := tgbotapi.NewMessage(update.Message.Chat.ID, "Выберите кнопку на клавиатуре или напишите команду /start")
 			bot.Send(msg)
 		}
 	}
 }
 
-// saveUserFromUpdate сохраняет/обновляет пользователя в таблице users
 func saveUserFromUpdate(update tgbotapi.Update) error {
 	if update.Message == nil || update.Message.From == nil {
 		return nil
@@ -231,21 +250,19 @@ func scrapeImages() {
 		}
 	}()
 
-	//ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-	//defer cancel()
-
 	start := time.Now()
 	log.Println("Начинаем скрапинг...")
 
-	// Создаем копию коллектора с таймаутами
+	// Создаем копию коллектора с убранными искусственными задержками
 	c := colly.NewCollector(
 		colly.Async(true),
 	)
 	c.SetRequestTimeout(30 * time.Second)
+	// Убираем RandomDelay, оставляем разумную параллельность
 	c.Limit(&colly.LimitRule{
 		DomainGlob:  "*",
-		Parallelism: 2,
-		RandomDelay: 1 * time.Second,
+		Parallelism: 4,
+		RandomDelay: 0,
 	})
 
 	// Очищаем старые данные
@@ -305,13 +322,10 @@ func scrapeImages() {
 		log.Printf("Colly error: %v (url=%s)", err, r.Request.URL.String())
 	})
 
-	err := c.Visit(baseSiteURL + targetPath)
-	if err != nil {
+	if err := c.Visit(baseSiteURL + targetPath); err != nil {
 		log.Printf("Ошибка Visit: %v", err)
 		return
 	}
-
-	// Ждём завершения всех асинхронных запросов
 	c.Wait()
 
 	mu.RLock()
@@ -319,7 +333,6 @@ func scrapeImages() {
 	mu.RUnlock()
 }
 
-// copyMap возвращает независимую копию map
 func copyMap(src map[string]time.Time) map[string]time.Time {
 	dst := make(map[string]time.Time, len(src))
 	for k, v := range src {
@@ -328,7 +341,6 @@ func copyMap(src map[string]time.Time) map[string]time.Time {
 	return dst
 }
 
-// sendSchedule отправляет все найденные изображения указанного корпуса
 func sendSchedule(chatID int64, corpus string) {
 	var scheduleMap map[string]time.Time
 	var corpusName string
@@ -344,7 +356,6 @@ func sendSchedule(chatID int64, corpus string) {
 		return
 	}
 
-	// --- Ключевое исправление: Копируем данные и сразу отпускаем мьютекс ---
 	mu.RLock()
 	if strings.ToUpper(corpus) == "A" {
 		scheduleMap = copyMap(scheduleA)
@@ -352,7 +363,6 @@ func sendSchedule(chatID int64, corpus string) {
 		scheduleMap = copyMap(scheduleB)
 	}
 	mu.RUnlock()
-	// --- Теперь работаем с КОПИЕЙ, не блокируя скрапер ---
 
 	if len(scheduleMap) == 0 {
 		msg := tgbotapi.NewMessage(chatID, fmt.Sprintf("Расписание для %s не найдено.", corpusName))
@@ -360,10 +370,9 @@ func sendSchedule(chatID int64, corpus string) {
 		return
 	}
 
-	// Отправляем изображения из копии
 	for url, date := range scheduleMap {
-		caption := fmt.Sprintf("Расписание на %02d.%02d ", date.Day(), date.Month())
-		uniqueURL := fmt.Sprintf("%s?cb=%d", url, time.Now().UnixNano()) // Добавляем уникальный параметр
+		caption := fmt.Sprintf("Расписание на %02d.%02d", date.Day(), int(date.Month()))
+		uniqueURL := fmt.Sprintf("%s?cb=%d", url, time.Now().UnixNano())
 		photo := tgbotapi.NewPhoto(chatID, tgbotapi.FileURL(uniqueURL))
 		photo.Caption = caption
 		if _, err := bot.Send(photo); err != nil {
@@ -374,7 +383,6 @@ func sendSchedule(chatID int64, corpus string) {
 	}
 }
 
-// sendStartMessage отправляет клавиатуру
 func sendStartMessage(chatID int64) {
 	msg := tgbotapi.NewMessage(chatID, "Привет! Выберите расписание:")
 	keyboard := tgbotapi.NewReplyKeyboard(
