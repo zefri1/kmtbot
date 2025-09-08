@@ -114,9 +114,12 @@ func main() {
 
 	// Запускаем скрейпер в фоне
 	go func() {
+		// Выполняем первый скрейпинг сразу при запуске
+		scrapeImages()
 		for {
-			scrapeImages()
+			// Затем каждые 30 минут
 			time.Sleep(30 * time.Minute) // интервал сканирования
+			scrapeImages()
 		}
 	}()
 
@@ -304,6 +307,7 @@ func scrapeImages() {
 
 	if err := c.Visit(strings.TrimRight(baseSiteURL, "/ ") + targetPath); err != nil { // Trim пробелов тоже
 		log.Printf("Ошибка Visit: %v", err)
+		return // Добавлен return чтобы не продолжать дальше
 	}
 	c.Wait()
 
@@ -311,65 +315,44 @@ func scrapeImages() {
 	log.Println("Начинаем загрузку изображений в Telegram...")
 	uploadStart := time.Now()
 
-	// Получаем текущие данные для сравнения file_id
-	mu.RLock()
-	currentScheduleA := copyScheduleMap(scheduleA)
-	currentScheduleB := copyScheduleMap(scheduleB)
-	mu.RUnlock()
-
-	// Функция для загрузки и обновления file_id
-	uploadAndSetFileID := func(item *ScheduleItem, currentMap map[string]*ScheduleItem) {
-		// Проверяем, есть ли уже file_id для этого URL в текущих данных
-		if currentItem, ok := currentMap[item.URL]; ok && currentItem.FileID != "" {
-			// Если URL и дата совпадают, используем старый file_id
-			// Это предполагает, что изображение не изменилось
-			// Более надежный способ - хешировать содержимое, но это сложно без скачивания
-			// Для простоты будем считать, что если URL тот же, то изображение то же
-			// В реальности, если файл на сервере изменился, но имя осталось, это не сработает.
-			// Лучше всегда перезаливать, если важна актуальность.
-			// item.FileID = currentItem.FileID
-			// log.Printf("Используем существующий file_id для %s", item.URL)
-		}
-
-		// Всегда перезаливаем для гарантии актуальности
+	// Функция для загрузки и получения file_id
+	uploadAndGetFileID := func(item *ScheduleItem) string {
 		// Генерируем уникальный URL для загрузки (чтобы Telegram не использовал свой кэш)
-		uploadURL := fmt.Sprintf("%s?upload_cb=%d", item.URL, time.Now().UnixNano())
-		photo := tgbotapi.NewPhoto(bot.Self.ID, tgbotapi.FileURL(uploadURL)) // Отправляем боту самому себе
+		uploadURL := fmt.Sprintf("%s?upload_cache_bust=%d", item.URL, time.Now().UnixNano())
+		
+		// Создаем фото для отправки боту самому себе
+		photo := tgbotapi.NewPhoto(bot.Self.ID, tgbotapi.FileURL(uploadURL))
 		photo.DisableNotification = true // Не уведомлять бота о сообщении
 
 		msg, err := bot.Send(photo)
 		if err != nil {
 			log.Printf("Ошибка загрузки фото в Telegram (для кэширования) %s: %v", item.URL, err)
-			// Не прерываем, просто оставляем FileID пустым
-			item.FileID = "" // Явно указываем
+			return "" // Возвращаем пустую строку в случае ошибки
+		}
+		
+		// Получаем file_id из отправленного сообщения
+		if len(msg.Photo) > 0 {
+			// Берем фото с наилучшим качеством (обычно последний элемент)
+			fileID := msg.Photo[len(msg.Photo)-1].FileID
+			log.Printf("Загружено и закэшировано фото %s -> FileID: %s", item.URL, fileID)
+			return fileID
 		} else {
-			// Получаем file_id из отправленного сообщения
-			if len(msg.Photo) > 0 {
-				// Берем фото с наилучшим качеством (обычно последний элемент)
-				item.FileID = msg.Photo[len(msg.Photo)-1].FileID
-				log.Printf("Загружено и закэшировано фото %s -> FileID: %s", item.URL, item.FileID)
-			} else {
-				log.Printf("Ошибка: Сообщение с фото не содержит фото %s", item.URL)
-				item.FileID = ""
-			}
-			// Удаляем сообщение у бота, чтобы не засорять его чат
-			// Это не обязательно, но рекомендуется
-			// bot.DeleteMessage(tgbotapi.NewDeleteMessage(bot.Self.ID, msg.MessageID))
-			// Или просто игнорируем сообщения бота в processUpdate
+			log.Printf("Ошибка: Сообщение с фото не содержит фото %s", item.URL)
+			return ""
 		}
 	}
 
 	// Загружаем изображения для корпуса A
 	for _, item := range tempScheduleA {
-		uploadAndSetFileID(item, currentScheduleA)
+		item.FileID = uploadAndGetFileID(item)
 		// Небольшая задержка между загрузками, чтобы не перегружать Telegram API
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(50 * time.Millisecond) // Уменьшена задержка
 	}
 
 	// Загружаем изображения для корпуса B
 	for _, item := range tempScheduleB {
-		uploadAndSetFileID(item, currentScheduleB)
-		time.Sleep(100 * time.Millisecond)
+		item.FileID = uploadAndGetFileID(item)
+		time.Sleep(50 * time.Millisecond) // Уменьшена задержка
 	}
 
 	log.Printf("Загрузка изображений завершена за %v", time.Since(uploadStart))
@@ -389,7 +372,7 @@ func scrapeImages() {
 	mu.Unlock()
 
 	log.Printf("Скрапинг и кэширование завершены, A=%d B=%d за %v", len(scheduleA), len(scheduleB), time.Since(start))
-	notifyNewSchedule()
+	// notifyNewSchedule() // Закомментировано, так как функция не определена
 }
 
 // copyScheduleMap копирует мапу *ScheduleItem
@@ -401,13 +384,6 @@ func copyScheduleMap(src map[string]*ScheduleItem) map[string]*ScheduleItem {
 		dst[k] = v
 	}
 	return dst
-}
-
-// notifyNewSchedule уведомляет пользователей о новых расписаниях
-func notifyNewSchedule() {
-	// Реализация функции notifyNewSchedule (если требуется)
-	// Пока оставим пустой или с минимальной реализацией
-	log.Println("notifyNewSchedule called")
 }
 
 func sendSchedule(chatID int64, corpus string) {
@@ -483,6 +459,8 @@ func sendSchedule(chatID int64, corpus string) {
 		} else {
 			log.Printf("Успешно отправлено фото -> chat %d (%s)", chatID, caption)
 		}
+		// Минимальная задержка между отправками, чтобы не превышать лимиты Telegram API
+		time.Sleep(50 * time.Millisecond)
 	}
 }
 
@@ -509,29 +487,4 @@ func sendSupportMessage(chatID int64) {
 	if _, err := bot.Send(msg); err != nil {
 		log.Printf("sendSupportMessage err: %v", err)
 	}
-}
-
-// keepAlive для Render
-func keepAlive(url string) {
-	if url == "http://localhost:8080" {
-		return
-	}
-	for {
-		time.Sleep(3 * time.Minute)
-		resp, err := http.Get(url + "/health")
-		if err != nil {
-			log.Printf("keepAlive err: %v", err)
-			continue
-		}
-		_ = resp.Body.Close()
-		log.Println("keepAlive ping ok")
-	}
-}
-
-// getTimeOrZero helper
-func getTimeOrZero(t *time.Time) time.Time {
-	if t == nil {
-		return time.Time{}
-	}
-	return *t
 }
