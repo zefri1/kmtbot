@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"math/rand"
 	"net/http"
@@ -152,6 +153,7 @@ func main() {
 	log.Fatal(http.ListenAndServe(":"+port, nil))
 }
 
+// keepAlive периодически пингует /health чтобы держать инстанс "тёплым"
 func keepAlive(externalURL string) {
 	client := &http.Client{Timeout: 5 * time.Second}
 	base := 3 * time.Minute
@@ -171,6 +173,7 @@ func keepAlive(externalURL string) {
 	}
 }
 
+// ensureUsersTable создаёт таблицу users, если её нет
 func ensureUsersTable(ctx context.Context) error {
 	_, err := db.Exec(ctx, `
 	CREATE TABLE IF NOT EXISTS users (
@@ -194,14 +197,19 @@ func handleWebhook(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
+// processUpdate — сохраняет пользователя в фоне и немедленно обрабатывает команду/текст
 func processUpdate(update tgbotapi.Update) {
-	// save user
+	// сохраняем пользователя в фоне — чтобы DB не блокировала отправку
 	if update.Message != nil && update.Message.From != nil {
-		if err := saveUserFromUpdate(update); err != nil {
-			log.Printf("saveUserFromUpdate err: %v", err)
-		}
+		// передаём копию update в горутину (передача по значению)
+		go func(up tgbotapi.Update) {
+			if err := saveUserFromUpdate(up); err != nil {
+				log.Printf("saveUserFromUpdate err: %v", err)
+			}
+		}(update)
 	}
 
+	// Обработка команд/текстовых сообщений (отправляем немедленно)
 	if update.Message != nil && update.Message.IsCommand() && update.Message.Command() == "start" {
 		sendStartMessage(update.Message.Chat.ID)
 	} else if update.Message != nil && update.Message.Text != "" {
@@ -219,6 +227,7 @@ func processUpdate(update tgbotapi.Update) {
 	}
 }
 
+// saveUserFromUpdate — синхронная функция сохранения (вызывается в фоне из processUpdate)
 func saveUserFromUpdate(update tgbotapi.Update) error {
 	if update.Message == nil || update.Message.From == nil {
 		return nil
@@ -296,7 +305,6 @@ func scrapeImages() {
 
 		now := time.Now()
 		loc := time.Local
-		// keep year from current scanning context (we'll format for 2025 later)
 		imageDate := time.Date(now.Year(), time.Month(month), day, 0, 0, 0, 0, loc)
 
 		if !strings.HasPrefix(imageSrc, "/") {
@@ -341,8 +349,30 @@ func copyMap(src map[string]time.Time) map[string]time.Time {
 	return dst
 }
 
-// sendSchedule: первое и второе фото отправляются синхронно без пауз.
-// Остальные — в горутине с минимальной паузой, чтобы не блокировать обработчик.
+// fetchImageBytes — параллельный фетч картинки в память (timeout задаётся)
+func fetchImageBytes(ctx context.Context, url string, timeout time.Duration) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	client := &http.Client{Timeout: timeout}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("bad status %d", resp.StatusCode)
+	}
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	return data, nil
+}
+
+// sendSchedule — параллельная предзагрузка первых двух фото, первое и второе отправляются как можно быстрее.
+// подпись: "Понедельник — 08.09.2025"
 func sendSchedule(chatID int64, corpus string) {
 	var scheduleMap map[string]time.Time
 	var corpusName string
@@ -353,12 +383,11 @@ func sendSchedule(chatID int64, corpus string) {
 	case "B":
 		corpusName = "корпуса Б"
 	default:
-		msg := tgbotapi.NewMessage(chatID, "Неизвестный корпус.")
-		_, _ = bot.Send(msg)
+		_, _ = bot.Send(tgbotapi.NewMessage(chatID, "Неизвестный корпус."))
 		return
 	}
 
-	// копируем данные под мьютексом
+	// Копируем под мьютексом
 	mu.RLock()
 	if strings.ToUpper(corpus) == "A" {
 		scheduleMap = copyMap(scheduleA)
@@ -368,12 +397,11 @@ func sendSchedule(chatID int64, corpus string) {
 	mu.RUnlock()
 
 	if len(scheduleMap) == 0 {
-		msg := tgbotapi.NewMessage(chatID, fmt.Sprintf("Расписание для %s не найдено.", corpusName))
-		_, _ = bot.Send(msg)
+		_, _ = bot.Send(tgbotapi.NewMessage(chatID, fmt.Sprintf("Расписание для %s не найдено.", corpusName)))
 		return
 	}
 
-	// собираем и сортируем по дате (старые -> новые)
+	// Собираем и сортируем по дате (old -> new)
 	type item struct {
 		url  string
 		date time.Time
@@ -389,64 +417,128 @@ func sendSchedule(chatID int64, corpus string) {
 		return items[i].date.Before(items[j].date)
 	})
 
-	// helper to build caption using 2025 year
+	// helper для подписи (2025)
 	buildCaption := func(d time.Time) string {
 		wd := time.Date(2025, d.Month(), d.Day(), 0, 0, 0, 0, time.Local).Weekday()
 		return fmt.Sprintf("%s — %02d.%02d.2025", weekdayRus[wd], d.Day(), int(d.Month()))
 	}
 
-	// send first photo immediately (synchronously)
+	// подготовка каналов для первых двух fetch'ей
+	type fetchRes struct {
+		data []byte
+		err  error
+	}
+	var ch0, ch1 chan fetchRes
+	ctxFetch := context.Background()
+	fetchTimeout := 6 * time.Second
+
+	if len(items) >= 1 {
+		ch0 = make(chan fetchRes, 1)
+		go func(url string) {
+			start := time.Now()
+			b, err := fetchImageBytes(ctxFetch, url, fetchTimeout)
+			log.Printf("fetch first finished for %s (err=%v) in %v", url, err, time.Since(start))
+			ch0 <- fetchRes{data: b, err: err}
+		}(items[0].url)
+	}
+	if len(items) >= 2 {
+		ch1 = make(chan fetchRes, 1)
+		go func(url string) {
+			start := time.Now()
+			b, err := fetchImageBytes(ctxFetch, url, fetchTimeout)
+			log.Printf("fetch second finished for %s (err=%v) in %v", url, err, time.Since(start))
+			ch1 <- fetchRes{data: b, err: err}
+		}(items[1].url)
+	}
+
+	// --- First: ждём результат первого фетча (с timeout на самом fetch) и отправляем ---
 	if len(items) >= 1 {
 		it := items[0]
 		caption := buildCaption(it.date)
-		uniqueURL := fmt.Sprintf("%s?cb=%d", it.url, time.Now().UnixNano())
-		photo := tgbotapi.NewPhoto(chatID, tgbotapi.FileURL(uniqueURL))
-		photo.Caption = caption
-		if _, err := bot.Send(photo); err != nil {
-			log.Printf("Ошибка отправки первого фото %s: %v", it.url, err)
+
+		var r0 fetchRes
+		if ch0 != nil {
+			r0 = <-ch0
 		} else {
-			log.Printf("Отправлено первое фото %s -> chat %d (%s)", it.url, chatID, caption)
+			r0 = fetchRes{data: nil, err: fmt.Errorf("no fetch")}
+		}
+
+		if r0.err == nil && len(r0.data) > 0 {
+			photo := tgbotapi.NewPhoto(chatID, tgbotapi.FileBytes{Name: "schedule1.jpg", Bytes: r0.data})
+			photo.Caption = caption
+			if _, err := bot.Send(photo); err != nil {
+				log.Printf("Ошибка отправки первого фото (upload) %s: %v", it.url, err)
+				// fallback по URL
+				photoURL := tgbotapi.NewPhoto(chatID, tgbotapi.FileURL(it.url))
+				photoURL.Caption = caption
+				_, _ = bot.Send(photoURL)
+			} else {
+				log.Printf("Отправлено первое фото (upload) %s -> chat %d (%s)", it.url, chatID, caption)
+			}
+		} else {
+			// fallback: отправляем по URL
+			photoURL := tgbotapi.NewPhoto(chatID, tgbotapi.FileURL(it.url))
+			photoURL.Caption = caption
+			if _, err := bot.Send(photoURL); err != nil {
+				log.Printf("Ошибка отправки первого фото по URL %s: %v", it.url, err)
+			} else {
+				log.Printf("Отправлено первое фото (url) %s -> chat %d (%s)", it.url, chatID, caption)
+			}
 		}
 	}
 
-	// send second photo immediately after first, without pause
+	// --- Second: ждём результат второго фетча и отправляем как можно быстрее ---
 	if len(items) >= 2 {
 		it := items[1]
 		caption := buildCaption(it.date)
-		uniqueURL := fmt.Sprintf("%s?cb=%d", it.url, time.Now().UnixNano())
-		photo := tgbotapi.NewPhoto(chatID, tgbotapi.FileURL(uniqueURL))
-		photo.Caption = caption
-		if _, err := bot.Send(photo); err != nil {
-			log.Printf("Ошибка отправки второго фото %s: %v", it.url, err)
+
+		var r1 fetchRes
+		if ch1 != nil {
+			r1 = <-ch1
 		} else {
-			log.Printf("Отправлено второе фото %s -> chat %d (%s)", it.url, chatID, caption)
+			r1 = fetchRes{data: nil, err: fmt.Errorf("no fetch")}
+		}
+
+		if r1.err == nil && len(r1.data) > 0 {
+			photo := tgbotapi.NewPhoto(chatID, tgbotapi.FileBytes{Name: "schedule2.jpg", Bytes: r1.data})
+			photo.Caption = caption
+			if _, err := bot.Send(photo); err != nil {
+				log.Printf("Ошибка отправки второго фото (upload) %s: %v", it.url, err)
+				photoURL := tgbotapi.NewPhoto(chatID, tgbotapi.FileURL(it.url))
+				photoURL.Caption = caption
+				_, _ = bot.Send(photoURL)
+			} else {
+				log.Printf("Отправлено второе фото (upload) %s -> chat %d (%s)", it.url, chatID, caption)
+			}
+		} else {
+			photoURL := tgbotapi.NewPhoto(chatID, tgbotapi.FileURL(it.url))
+			photoURL.Caption = caption
+			if _, err := bot.Send(photoURL); err != nil {
+				log.Printf("Ошибка отправки второго фото по URL %s: %v", it.url, err)
+			} else {
+				log.Printf("Отправлено второе фото (url) %s -> chat %d (%s)", it.url, chatID, caption)
+			}
 		}
 	}
 
-	// if more than 2 items — send the rest in background with minimal pause
+	// --- Оставшиеся фото (3+) отправляем в фоне с минимальной паузой, чтобы не блокировать обработчик ---
 	if len(items) > 2 {
 		rest := make([]item, 0, len(items)-2)
 		for i := 2; i < len(items); i++ {
 			rest = append(rest, items[i])
 		}
-
 		go func(toSend []item) {
-			// very small base interval to avoid hammering (can be tuned)
-			baseInterval := 50 * time.Millisecond
-			jitterRange := 20 * time.Millisecond // ±10ms
-
+			baseInterval := 40 * time.Millisecond
+			jitterRange := 20 * time.Millisecond
 			for idx, it := range toSend {
-				caption := buildCaption(it.date)
-				uniqueURL := fmt.Sprintf("%s?cb=%d", it.url, time.Now().UnixNano())
-				photo := tgbotapi.NewPhoto(chatID, tgbotapi.FileURL(uniqueURL))
+				wd := time.Date(2025, it.date.Month(), it.date.Day(), 0, 0, 0, 0, time.Local).Weekday()
+				caption := fmt.Sprintf("%s — %02d.%02d.2025", weekdayRus[wd], it.date.Day(), int(it.date.Month()))
+				photo := tgbotapi.NewPhoto(chatID, tgbotapi.FileURL(it.url))
 				photo.Caption = caption
 				if _, err := bot.Send(photo); err != nil {
 					log.Printf("Ошибка отправки фото %s: %v", it.url, err)
-				} else {
-					log.Printf("Отправлено фото %s -> chat %d (%s)", it.url, chatID, caption)
 				}
-
-				// pause before next (if any)
+				// пауза перед следующим
 				if idx < len(toSend)-1 {
 					j := time.Duration(rand.Int63n(int64(jitterRange))) - jitterRange/2
 					interval := baseInterval + j
