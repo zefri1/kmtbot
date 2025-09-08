@@ -29,9 +29,19 @@ var (
 	bot       *tgbotapi.BotAPI
 	db        *pgxpool.Pool
 	mu        sync.RWMutex
-	scheduleA = make(map[string]time.Time) // URL -> date (day+month, year may be ignored)
+	scheduleA = make(map[string]time.Time) // URL -> date
 	scheduleB = make(map[string]time.Time)
 )
+
+var weekdayRus = map[time.Weekday]string{
+	time.Monday:    "Понедельник",
+	time.Tuesday:   "Вторник",
+	time.Wednesday: "Среда",
+	time.Thursday:  "Четверг",
+	time.Friday:    "Пятница",
+	time.Saturday:  "Суббота",
+	time.Sunday:    "Воскресенье",
+}
 
 func main() {
 	rand.Seed(time.Now().UnixNano())
@@ -45,6 +55,7 @@ func main() {
 		log.Fatal("DATABASE_URL не задан. Установите переменную окружения.")
 	}
 
+	// Postgres pool
 	ctx := context.Background()
 	cfg, err := pgxpool.ParseConfig(databaseURL)
 	if err != nil {
@@ -69,12 +80,14 @@ func main() {
 		log.Fatalf("ensureUsersTable: %v", err)
 	}
 
+	// Telegram bot
 	bot, err = tgbotapi.NewBotAPI(telegramToken)
 	if err != nil {
 		log.Fatalf("Ошибка при создании бота: %v", err)
 	}
 	log.Printf("Авторизован как: %s", bot.Self.UserName)
 
+	// Webhook
 	externalURL := os.Getenv("RENDER_EXTERNAL_URL")
 	if externalURL == "" {
 		externalURL = "http://localhost:8080"
@@ -92,12 +105,13 @@ func main() {
 	}
 	log.Printf("Вебхук установлен на: %s", webhookURL)
 
+	// pprof (локально)
 	go func() {
 		log.Println("pprof слушает на :6060 (локально)")
 		log.Fatal(http.ListenAndServe(":6060", nil))
 	}()
 
-	// Скрейпер
+	// Скрейпер (фон)
 	go func() {
 		for {
 			scrapeImages()
@@ -105,14 +119,15 @@ func main() {
 		}
 	}()
 
-	// keep-alive (3мин ±30с)
+	// self-ping (keep-alive) 3 мин ±30s
 	go keepAlive(externalURL)
 
+	// HTTP handlers
 	http.HandleFunc(webhookPath, handleWebhook)
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/" {
 			w.WriteHeader(http.StatusOK)
-			w.Write([]byte("Bot running"))
+			_, _ = w.Write([]byte("Bot running"))
 			return
 		}
 		http.NotFound(w, r)
@@ -125,7 +140,7 @@ func main() {
 			return
 		}
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("ok"))
+		_, _ = w.Write([]byte("ok"))
 	})
 
 	port := os.Getenv("PORT")
@@ -180,6 +195,7 @@ func handleWebhook(w http.ResponseWriter, r *http.Request) {
 }
 
 func processUpdate(update tgbotapi.Update) {
+	// save user
 	if update.Message != nil && update.Message.From != nil {
 		if err := saveUserFromUpdate(update); err != nil {
 			log.Printf("saveUserFromUpdate err: %v", err)
@@ -198,7 +214,7 @@ func processUpdate(update tgbotapi.Update) {
 			sendSupportMessage(update.Message.Chat.ID)
 		default:
 			msg := tgbotapi.NewMessage(update.Message.Chat.ID, "Выберите кнопку на клавиатуре или напишите команду /start")
-			bot.Send(msg)
+			_, _ = bot.Send(msg)
 		}
 	}
 }
@@ -280,6 +296,7 @@ func scrapeImages() {
 
 		now := time.Now()
 		loc := time.Local
+		// keep year from current scanning context (we'll format for 2025 later)
 		imageDate := time.Date(now.Year(), time.Month(month), day, 0, 0, 0, 0, loc)
 
 		if !strings.HasPrefix(imageSrc, "/") {
@@ -324,19 +341,8 @@ func copyMap(src map[string]time.Time) map[string]time.Time {
 	return dst
 }
 
-var weekdayRus = map[time.Weekday]string{
-	time.Monday:    "Понедельник",
-	time.Tuesday:   "Вторник",
-	time.Wednesday: "Среда",
-	time.Thursday:  "Четверг",
-	time.Friday:    "Пятница",
-	time.Saturday:  "Суббота",
-	time.Sunday:    "Воскресенье",
-}
-
-// sendSchedule: отправляет фото по дате (старые -> новые).
-// Первое фото отправляется сразу, между сообщениями минимальная пауза (~150ms).
-// Подпись: "Понедельник — 02.03.2025"
+// sendSchedule: первое и второе фото отправляются синхронно без пауз.
+// Остальные — в горутине с минимальной паузой, чтобы не блокировать обработчик.
 func sendSchedule(chatID int64, corpus string) {
 	var scheduleMap map[string]time.Time
 	var corpusName string
@@ -348,11 +354,11 @@ func sendSchedule(chatID int64, corpus string) {
 		corpusName = "корпуса Б"
 	default:
 		msg := tgbotapi.NewMessage(chatID, "Неизвестный корпус.")
-		bot.Send(msg)
+		_, _ = bot.Send(msg)
 		return
 	}
 
-	// Копируем под мьютексом
+	// копируем данные под мьютексом
 	mu.RLock()
 	if strings.ToUpper(corpus) == "A" {
 		scheduleMap = copyMap(scheduleA)
@@ -363,11 +369,11 @@ func sendSchedule(chatID int64, corpus string) {
 
 	if len(scheduleMap) == 0 {
 		msg := tgbotapi.NewMessage(chatID, fmt.Sprintf("Расписание для %s не найдено.", corpusName))
-		bot.Send(msg)
+		_, _ = bot.Send(msg)
 		return
 	}
 
-	// Собираем и сортируем по дате (old->new)
+	// собираем и сортируем по дате (старые -> новые)
 	type item struct {
 		url  string
 		date time.Time
@@ -383,35 +389,74 @@ func sendSchedule(chatID int64, corpus string) {
 		return items[i].date.Before(items[j].date)
 	})
 
-	// Интервал между отправками: примерно 150ms ±20ms
-	baseInterval := 150 * time.Millisecond
-	jitterRange := 40 * time.Millisecond // ±20ms
+	// helper to build caption using 2025 year
+	buildCaption := func(d time.Time) string {
+		wd := time.Date(2025, d.Month(), d.Day(), 0, 0, 0, 0, time.Local).Weekday()
+		return fmt.Sprintf("%s — %02d.%02d.2025", weekdayRus[wd], d.Day(), int(d.Month()))
+	}
 
-	for idx, it := range items {
-		// Формируем подпись с днём недели для 2025 года
-		weekdayDate := time.Date(2025, it.date.Month(), it.date.Day(), 0, 0, 0, 0, time.Local)
-		wname := weekdayRus[weekdayDate.Weekday()]
-		caption := fmt.Sprintf("%s — %02d.%02d.2025", wname, it.date.Day(), int(it.date.Month()))
-
+	// send first photo immediately (synchronously)
+	if len(items) >= 1 {
+		it := items[0]
+		caption := buildCaption(it.date)
 		uniqueURL := fmt.Sprintf("%s?cb=%d", it.url, time.Now().UnixNano())
 		photo := tgbotapi.NewPhoto(chatID, tgbotapi.FileURL(uniqueURL))
 		photo.Caption = caption
-
 		if _, err := bot.Send(photo); err != nil {
-			log.Printf("Ошибка отправки фото %s: %v", it.url, err)
+			log.Printf("Ошибка отправки первого фото %s: %v", it.url, err)
 		} else {
-			log.Printf("Отправлено фото %s -> chat %d (%s)", it.url, chatID, caption)
+			log.Printf("Отправлено первое фото %s -> chat %d (%s)", it.url, chatID, caption)
+		}
+	}
+
+	// send second photo immediately after first, without pause
+	if len(items) >= 2 {
+		it := items[1]
+		caption := buildCaption(it.date)
+		uniqueURL := fmt.Sprintf("%s?cb=%d", it.url, time.Now().UnixNano())
+		photo := tgbotapi.NewPhoto(chatID, tgbotapi.FileURL(uniqueURL))
+		photo.Caption = caption
+		if _, err := bot.Send(photo); err != nil {
+			log.Printf("Ошибка отправки второго фото %s: %v", it.url, err)
+		} else {
+			log.Printf("Отправлено второе фото %s -> chat %d (%s)", it.url, chatID, caption)
+		}
+	}
+
+	// if more than 2 items — send the rest in background with minimal pause
+	if len(items) > 2 {
+		rest := make([]item, 0, len(items)-2)
+		for i := 2; i < len(items); i++ {
+			rest = append(rest, items[i])
 		}
 
-		// Никакой паузы после последнего сообщения
-		if idx < len(items)-1 {
-			j := time.Duration(rand.Int63n(int64(jitterRange))) - jitterRange/2
-			interval := baseInterval + j
-			if interval < 50*time.Millisecond {
-				interval = 50 * time.Millisecond
+		go func(toSend []item) {
+			// very small base interval to avoid hammering (can be tuned)
+			baseInterval := 50 * time.Millisecond
+			jitterRange := 20 * time.Millisecond // ±10ms
+
+			for idx, it := range toSend {
+				caption := buildCaption(it.date)
+				uniqueURL := fmt.Sprintf("%s?cb=%d", it.url, time.Now().UnixNano())
+				photo := tgbotapi.NewPhoto(chatID, tgbotapi.FileURL(uniqueURL))
+				photo.Caption = caption
+				if _, err := bot.Send(photo); err != nil {
+					log.Printf("Ошибка отправки фото %s: %v", it.url, err)
+				} else {
+					log.Printf("Отправлено фото %s -> chat %d (%s)", it.url, chatID, caption)
+				}
+
+				// pause before next (if any)
+				if idx < len(toSend)-1 {
+					j := time.Duration(rand.Int63n(int64(jitterRange))) - jitterRange/2
+					interval := baseInterval + j
+					if interval < 10*time.Millisecond {
+						interval = 10 * time.Millisecond
+					}
+					time.Sleep(interval)
+				}
 			}
-			time.Sleep(interval)
-		}
+		}(rest)
 	}
 }
 
@@ -427,14 +472,10 @@ func sendStartMessage(chatID int64) {
 		),
 	)
 	msg.ReplyMarkup = keyboard
-	if _, err := bot.Send(msg); err != nil {
-		log.Printf("sendStartMessage err: %v", err)
-	}
+	_, _ = bot.Send(msg)
 }
 
 func sendSupportMessage(chatID int64) {
 	msg := tgbotapi.NewMessage(chatID, "По вопросам поддержки: @podkmt")
-	if _, err := bot.Send(msg); err != nil {
-		log.Printf("sendSupportMessage err: %v", err)
-	}
+	_, _ = bot.Send(msg)
 }
