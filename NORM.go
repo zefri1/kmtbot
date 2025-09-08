@@ -363,7 +363,8 @@ func sendSchedule(chatID int64, corpus string) {
 	// Отправляем изображения из копии
 	for url, date := range scheduleMap {
 		caption := fmt.Sprintf("Расписание на %02d.%02d ", date.Day(), date.Month())
-		photo := tgbotapi.NewPhoto(chatID, tgbotapi.FileURL(url))
+		uniqueURL := fmt.Sprintf("%s?cb=%d", url, time.Now().UnixNano()) // Добавляем уникальный параметр
+		photo := tgbotapi.NewPhoto(chatID, tgbotapi.FileURL(uniqueURL))
 		photo.Caption = caption
 		if _, err := bot.Send(photo); err != nil {
 			log.Printf("Ошибка отправки фото %s: %v", url, err)
