@@ -280,6 +280,7 @@ func sendSchedule(chatID int64, corpus string) {
 		bot.Send(tgbotapi.NewMessage(chatID, "Расписание не найдено."))
 		return
 	}
+
 	type item struct {
 		url  string
 		date time.Time
@@ -292,8 +293,18 @@ func sendSchedule(chatID int64, corpus string) {
 		return items[i].date.Before(items[j].date)
 	})
 
+	weekdays := map[time.Weekday]string{
+		time.Monday:    "Понедельник",
+		time.Tuesday:   "Вторник",
+		time.Wednesday: "Среда",
+		time.Thursday:  "Четверг",
+		time.Friday:    "Пятница",
+		time.Saturday:  "Суббота",
+		time.Sunday:    "Воскресенье",
+	}
+
 	for _, it := range items {
-		weekday := it.date.Weekday().String()
+		weekday := weekdays[it.date.Weekday()]
 		caption := fmt.Sprintf("%s — %02d.%02d.%d", weekday, it.date.Day(), it.date.Month(), it.date.Year())
 		uniqueURL := fmt.Sprintf("%s?cb=%d", it.url, time.Now().UnixNano())
 		photo := tgbotapi.NewPhoto(chatID, tgbotapi.FileURL(uniqueURL))
@@ -303,6 +314,7 @@ func sendSchedule(chatID int64, corpus string) {
 		}
 	}
 }
+
 
 func sendStartMessage(chatID int64) {
 	msg := tgbotapi.NewMessage(chatID, "Привет! Выберите расписание:")
