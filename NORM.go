@@ -62,7 +62,7 @@ func main() {
 		log.Fatalf("Не удалось подключиться к БД: %v", err)
 	}
 
-	// Таблицы
+	// Создаем таблицы
 	ensureTables(ctx)
 
 	bot, err = tgbotapi.NewBotAPI(telegramToken)
@@ -99,6 +99,7 @@ func main() {
 	// Self-ping для Render
 	go keepAlive(externalURL)
 
+	// HTTP сервер
 	http.HandleFunc(webhookPath, handleWebhook)
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -169,17 +170,23 @@ func processUpdate(update tgbotapi.Update) {
 	if update.Message != nil && update.Message.From != nil {
 		go saveUser(update)
 	}
+
 	if update.Message != nil && update.Message.IsCommand() && update.Message.Command() == "start" {
+		log.Printf("Пользователь %d нажал /start", update.Message.From.ID)
 		sendStartMessage(update.Message.Chat.ID)
 	} else if update.Message != nil && update.Message.Text != "" {
 		switch update.Message.Text {
 		case "Расписание А":
+			log.Printf("Пользователь %d запросил Расписание А", update.Message.From.ID)
 			sendSchedule(update.Message.Chat.ID, "A")
 		case "Расписание Б":
+			log.Printf("Пользователь %d запросил Расписание Б", update.Message.From.ID)
 			sendSchedule(update.Message.Chat.ID, "B")
 		case "Поддержка и предложения":
+			log.Printf("Пользователь %d запросил поддержку", update.Message.From.ID)
 			sendSupportMessage(update.Message.Chat.ID)
 		default:
+			log.Printf("Пользователь %d написал неизвестную команду: %s", update.Message.From.ID, update.Message.Text)
 			bot.Send(tgbotapi.NewMessage(update.Message.Chat.ID, "Выберите кнопку или /start"))
 		}
 	}
@@ -203,6 +210,7 @@ func saveUser(update tgbotapi.Update) {
 	VALUES($1)
 	ON CONFLICT DO NOTHING;
 	`, userId)
+	log.Printf("User saved: %d (%s)", userId, username)
 }
 
 func scrapeImages() {
@@ -212,6 +220,8 @@ func scrapeImages() {
 		}
 	}()
 	start := time.Now()
+	log.Println("Начало скрапинга...")
+
 	c := colly.NewCollector(colly.Async(true))
 	c.SetRequestTimeout(30 * time.Second)
 	c.Limit(&colly.LimitRule{DomainGlob: "*", Parallelism: 2, RandomDelay: 1 * time.Second})
@@ -226,6 +236,7 @@ func scrapeImages() {
 		re := regexp.MustCompile(`/1Raspisanie/(\d{1,2})\.(\d{1,2})(?:\.\d{4})?_korpus_([av])\.jpe?g$`)
 		matches := re.FindStringSubmatch(imageSrc)
 		if len(matches) != 4 {
+			log.Printf("Пропущено: URL не соответствует формату %s", imageSrc)
 			return
 		}
 		day, _ := strconv.Atoi(matches[1])
@@ -237,15 +248,29 @@ func scrapeImages() {
 			imageSrc = "/" + imageSrc
 		}
 		fullURL := strings.TrimRight(baseSiteURL, "/") + imageSrc
+
 		mu.Lock()
 		if corpus == "a" {
 			scheduleA[fullURL] = date
+			log.Printf("Найдено фото корпуса А: %s (%02d.%02d.%d)", fullURL, day, month, now.Year())
 		} else {
 			scheduleB[fullURL] = date
+			log.Printf("Найдено фото корпуса Б: %s (%02d.%02d.%d)", fullURL, day, month, now.Year())
 		}
 		mu.Unlock()
 	})
-	c.Visit(baseSiteURL + targetPath)
+
+	c.OnRequest(func(r *colly.Request) {
+		log.Printf("Visiting %s", r.URL.String())
+	})
+
+	c.OnError(func(r *colly.Response, err error) {
+		log.Printf("Ошибка скрапинга %s: %v", r.Request.URL.String(), err)
+	})
+
+	if err := c.Visit(baseSiteURL + targetPath); err != nil {
+		log.Printf("Ошибка Visit: %v", err)
+	}
 	c.Wait()
 	log.Printf("Скрапинг завершён, A=%d B=%d за %v", len(scheduleA), len(scheduleB), time.Since(start))
 	notifyNewSchedule()
@@ -253,6 +278,7 @@ func scrapeImages() {
 
 func notifyNewSchedule() {
 	ctx := context.Background()
+
 	mu.RLock()
 	scheduleACopy := copyMap(scheduleA)
 	scheduleBCopy := copyMap(scheduleB)
@@ -270,21 +296,32 @@ func notifyNewSchedule() {
 		}
 	}
 
-	rows, _ := db.Query(ctx, "SELECT user_id, last_day_a, last_day_b FROM user_last_schedule")
+	rows, err := db.Query(ctx, "SELECT user_id, last_day_a, last_day_b FROM user_last_schedule")
+	if err != nil {
+		log.Printf("Ошибка запроса user_last_schedule: %v", err)
+		return
+	}
 	defer rows.Close()
 
 	for rows.Next() {
 		var userID int64
 		var lastA, lastB *time.Time
-		rows.Scan(&userID, &lastA, &lastB)
+		if err := rows.Scan(&userID, &lastA, &lastB); err != nil {
+			log.Printf("Ошибка Scan: %v", err)
+			continue
+		}
 
 		if maxA.After(getTimeOrZero(lastA)) {
-			bot.Send(tgbotapi.NewMessage(userID, fmt.Sprintf("Появилось новое расписание корпуса А: %02d.%02d.%d", maxA.Day(), maxA.Month(), maxA.Year())))
+			msgText := fmt.Sprintf("Появилось новое расписание корпуса А: %02d.%02d.%d", maxA.Day(), maxA.Month(), maxA.Year())
+			bot.Send(tgbotapi.NewMessage(userID, msgText))
 			db.Exec(ctx, "UPDATE user_last_schedule SET last_day_a=$1 WHERE user_id=$2", maxA, userID)
+			log.Printf("Уведомление A отправлено пользователю %d", userID)
 		}
 		if maxB.After(getTimeOrZero(lastB)) {
-			bot.Send(tgbotapi.NewMessage(userID, fmt.Sprintf("Появилось новое расписание корпуса Б: %02d.%02d.%d", maxB.Day(), maxB.Month(), maxB.Year())))
+			msgText := fmt.Sprintf("Появилось новое расписание корпуса Б: %02d.%02d.%d", maxB.Day(), maxB.Month(), maxB.Year())
+			bot.Send(tgbotapi.NewMessage(userID, msgText))
 			db.Exec(ctx, "UPDATE user_last_schedule SET last_day_b=$1 WHERE user_id=$2", maxB, userID)
+			log.Printf("Уведомление B отправлено пользователю %d", userID)
 		}
 	}
 }
@@ -349,7 +386,9 @@ func sendSchedule(chatID int64, corpus string) {
 		photo := tgbotapi.NewPhoto(chatID, tgbotapi.FileURL(uniqueURL))
 		photo.Caption = caption
 		if _, err := bot.Send(photo); err != nil {
-			log.Printf("Ошибка отправки %s: %v", it.url, err)
+			log.Printf("Ошибка отправки фото %s: %v", it.url, err)
+		} else {
+			log.Printf("Отправлено фото %s -> chat %d (%s)", it.url, chatID, caption)
 		}
 	}
 }
@@ -366,9 +405,14 @@ func sendStartMessage(chatID int64) {
 		),
 	)
 	msg.ReplyMarkup = keyboard
-	bot.Send(msg)
+	if _, err := bot.Send(msg); err != nil {
+		log.Printf("sendStartMessage err: %v", err)
+	}
 }
 
 func sendSupportMessage(chatID int64) {
-	bot.Send(tgbotapi.NewMessage(chatID, "По вопросам поддержки: @podkmt"))
+	msg := tgbotapi.NewMessage(chatID, "По вопросам поддержки: @podkmt")
+	if _, err := bot.Send(msg); err != nil {
+		log.Printf("sendSupportMessage err: %v", err)
+	}
 }
