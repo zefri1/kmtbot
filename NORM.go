@@ -3,7 +3,7 @@ package main
 
 import (
 	"context"
-	"database/sql" // Для sql.NullString
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -20,14 +20,13 @@ import (
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 	"github.com/gocolly/colly/v2"
 	"github.com/jackc/pgx/v5/pgxpool"
-	_ "github.com/jackc/pgx/v5/stdlib" // если потребуется совместимость с database/sql
+	_ "github.com/jackc/pgx/v5/stdlib"
 )
 
 const (
 	webhookPath = "/webhook"
 	baseSiteURL = "https://kmtko.my1.ru"
 	targetPath  = "/index/raspisanie_zanjatij_ochno/0-403"
-	// adminChatID: обязательно int64, чтобы корректно передавать в API
 	adminChatID = int64(6436017953)
 )
 
@@ -43,16 +42,17 @@ var (
 	mu        sync.RWMutex
 	scheduleA = make(map[string]*ScheduleItem)
 	scheduleB = make(map[string]*ScheduleItem)
+	lastScrapeSuccess = false // <-- новая переменная для контроля успешного скрапинга
 )
 
 func main() {
 	telegramToken := os.Getenv("TELEGRAM_TOKEN")
 	if telegramToken == "" {
-		log.Fatal("TELEGRAM_TOKEN не задан. Установите переменную окружения.")
+		log.Fatal("TELEGRAM_TOKEN не задан")
 	}
 	databaseURL := os.Getenv("DATABASE_URL")
 	if databaseURL == "" {
-		log.Fatal("DATABASE_URL не задан. Установите переменную окружения.")
+		log.Fatal("DATABASE_URL не задан")
 	}
 
 	ctx := context.Background()
@@ -60,7 +60,6 @@ func main() {
 	if err != nil {
 		log.Fatalf("pgxpool.ParseConfig: %v", err)
 	}
-	// Параметры пула — можно менять под нагрузку
 	cfg.MaxConns = 10
 	cfg.MinConns = 1
 	cfg.MaxConnLifetime = 30 * time.Minute
@@ -71,13 +70,11 @@ func main() {
 	}
 	defer db.Close()
 
-	// Проверка соединения
 	if err := db.Ping(ctx); err != nil {
 		log.Fatalf("Не удалось подключиться к БД: %v", err)
 	}
 	log.Println("Успешно подключились к Postgres")
 
-	// Простая миграция
 	if err := ensureUsersTable(ctx); err != nil {
 		log.Fatalf("ensureUsersTable: %v", err)
 	}
@@ -85,18 +82,16 @@ func main() {
 		log.Fatalf("ensureScheduleTable: %v", err)
 	}
 
-	// Инициализация бота
 	bot, err = tgbotapi.NewBotAPI(telegramToken)
 	if err != nil {
 		log.Fatalf("Ошибка при создании бота: %v", err)
 	}
 	log.Printf("Авторизован как: %s", bot.Self.UserName)
 
-	// Вебхук
 	externalURL := os.Getenv("RENDER_EXTERNAL_URL")
 	if externalURL == "" {
 		externalURL = "http://localhost:8080"
-		log.Println("RENDER_EXTERNAL_URL не найден, использую localhost (локально).")
+		log.Println("RENDER_EXTERNAL_URL не найден, использую localhost")
 	}
 	webhookURL := strings.TrimRight(externalURL, "/") + webhookPath
 	wh, err := tgbotapi.NewWebhook(webhookURL)
@@ -109,15 +104,12 @@ func main() {
 	}
 	log.Printf("Вебхук установлен на: %s", webhookURL)
 
-	// pprof (локально)
 	go func() {
-		log.Println("pprof слушает на :6060 (локально)")
+		log.Println("pprof слушает на :6060")
 		log.Fatal(http.ListenAndServe(":6060", nil))
 	}()
 
-	// Запуск скрейпера в фоне
 	go func() {
-		// Первый запуск сразу
 		scrapeImages()
 		for {
 			time.Sleep(30 * time.Minute)
@@ -125,7 +117,6 @@ func main() {
 		}
 	}()
 
-	// HTTP handlers
 	http.HandleFunc(webhookPath, handleWebhook)
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/" {
@@ -154,7 +145,6 @@ func main() {
 	log.Fatal(http.ListenAndServe(":"+port, nil))
 }
 
-// ensureUsersTable создаёт таблицу users, если её нет
 func ensureUsersTable(ctx context.Context) error {
 	_, err := db.Exec(ctx, `
 	CREATE TABLE IF NOT EXISTS users (
@@ -167,7 +157,6 @@ func ensureUsersTable(ctx context.Context) error {
 	return err
 }
 
-// ensureScheduleTable создаёт таблицу schedule_cache, если её нет
 func ensureScheduleTable(ctx context.Context) error {
 	_, err := db.Exec(ctx, `
 	CREATE TABLE IF NOT EXISTS schedule_cache (
@@ -180,7 +169,6 @@ func ensureScheduleTable(ctx context.Context) error {
 	return err
 }
 
-// handleWebhook обрабатывает входящие webhook'и
 func handleWebhook(w http.ResponseWriter, r *http.Request) {
 	var update tgbotapi.Update
 	if err := json.NewDecoder(r.Body).Decode(&update); err != nil {
@@ -188,21 +176,17 @@ func handleWebhook(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
-	// Обработка асинхронно, но ответ webhook'у сразу
 	go processUpdate(update)
 	w.WriteHeader(http.StatusOK)
 }
 
-// processUpdate обрабатывает одно обновление
 func processUpdate(update tgbotapi.Update) {
-	// Сохраняем/обновляем пользователя
 	if update.Message != nil && update.Message.From != nil {
 		if err := saveUserFromUpdate(update); err != nil {
 			log.Printf("saveUserFromUpdate err: %v", err)
 		}
 	}
 
-	// Обработка команд и текста
 	if update.Message != nil && update.Message.IsCommand() && update.Message.Command() == "start" {
 		sendStartMessage(update.Message.Chat.ID)
 	} else if update.Message != nil && update.Message.Text != "" {
@@ -242,7 +226,6 @@ func saveUserFromUpdate(update tgbotapi.Update) error {
 	return nil
 }
 
-// getUsersIDs получает список всех ID пользователей из БД
 func getUsersIDs(ctx context.Context) ([]int64, error) {
 	rows, err := db.Query(ctx, "SELECT id FROM users")
 	if err != nil {
@@ -265,7 +248,6 @@ func getUsersIDs(ctx context.Context) ([]int64, error) {
 	return ids, nil
 }
 
-// loadScheduleCache загружает текущий кэш расписания из БД
 func loadScheduleCache(ctx context.Context) (map[string]*ScheduleItem, map[string]*ScheduleItem, error) {
 	rows, err := db.Query(ctx, "SELECT url, corpus, scraped_date, file_id FROM schedule_cache")
 	if err != nil {
@@ -296,7 +278,6 @@ func loadScheduleCache(ctx context.Context) (map[string]*ScheduleItem, map[strin
 	return sA, sB, nil
 }
 
-// saveScheduleCache сохраняет новый кэш расписания в БД (через транзакцию)
 func saveScheduleCache(ctx context.Context, scheduleA, scheduleB map[string]*ScheduleItem) error {
 	tx, err := db.Begin(ctx)
 	if err != nil {
@@ -331,7 +312,6 @@ func saveScheduleCache(ctx context.Context, scheduleA, scheduleB map[string]*Sch
 	return nil
 }
 
-// findNewItems находит элементы в newMap, которых нет в oldMap
 func findNewItems(newMap, oldMap map[string]*ScheduleItem) map[string]*ScheduleItem {
 	newItems := make(map[string]*ScheduleItem)
 	for url, newItem := range newMap {
@@ -342,57 +322,13 @@ func findNewItems(newMap, oldMap map[string]*ScheduleItem) map[string]*ScheduleI
 	return newItems
 }
 
-// sendNotificationForNewItems отправляет конкретные новые расписания пользователю
-func sendNotificationForNewItems(chatID int64, corpus string, newItems map[string]*ScheduleItem) {
-	type item struct{ *ScheduleItem }
-	var items []item
-	for _, it := range newItems {
-		items = append(items, item{it})
-	}
-	sort.Slice(items, func(i, j int) bool {
-		return items[i].Date.Before(items[j].Date)
-	})
-
-	weekdays := map[time.Weekday]string{
-		time.Monday:    "Понедельник",
-		time.Tuesday:   "Вторник",
-		time.Wednesday: "Среда",
-		time.Thursday:  "Четверг",
-		time.Friday:    "Пятница",
-		time.Saturday:  "Суббота",
-		time.Sunday:    "Воскресенье",
-	}
-
-	headerMsg := tgbotapi.NewMessage(chatID, fmt.Sprintf("🔔 Новое расписание для корпуса %s!", corpus))
-	if _, err := bot.Send(headerMsg); err != nil {
-		log.Printf("Ошибка отправки заголовка уведомления пользователю %d: %v", chatID, err)
-	}
-
-	for _, it := range items {
-		weekday := weekdays[it.Date.Weekday()]
-		caption := fmt.Sprintf("%s — %02d.%02d.%d", weekday, it.Date.Day(), it.Date.Month(), it.Date.Year())
-
-		var msg tgbotapi.Chattable
-		if it.FileID != "" {
-			photo := tgbotapi.NewPhoto(chatID, tgbotapi.FileID(it.FileID))
-			photo.Caption = caption
-			msg = photo
-		} else {
-			uniqueURL := fmt.Sprintf("%s?notify_new=%d", it.URL, time.Now().UnixNano())
-			photo := tgbotapi.NewPhoto(chatID, tgbotapi.FileURL(uniqueURL))
-			photo.Caption = caption
-			msg = photo
-		}
-
-		if _, err := bot.Send(msg); err != nil {
-			log.Printf("Ошибка отправки нового расписания пользователю %d: %v", chatID, err)
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-}
-
-// notifyUsersAboutNewSchedule уведомляет всех пользователей о новых расписаниях
+// --- исправлено: уведомления только если предыдущий скрап был успешным ---
 func notifyUsersAboutNewSchedule(newScheduleA, newScheduleB, oldScheduleA, oldScheduleB map[string]*ScheduleItem) {
+	if !lastScrapeSuccess {
+		log.Println("Предыдущий скрапинг не был успешным, уведомления не отправляем.")
+		return
+	}
+
 	newItemsA := findNewItems(newScheduleA, oldScheduleA)
 	newItemsB := findNewItems(newScheduleB, oldScheduleB)
 
@@ -406,11 +342,11 @@ func notifyUsersAboutNewSchedule(newScheduleA, newScheduleB, oldScheduleA, oldSc
 	userIDs, err := getUsersIDs(ctx)
 	if err != nil {
 		log.Printf("Ошибка получения списка пользователей: %v", err)
-		// продолжаем с пустым списком (ничего не отправим)
+		return
 	}
 
 	var wg sync.WaitGroup
-	semaphore := make(chan struct{}, 10) // ограничение параллельности
+	semaphore := make(chan struct{}, 10)
 
 	for _, userID := range userIDs {
 		wg.Add(1)
@@ -431,7 +367,16 @@ func notifyUsersAboutNewSchedule(newScheduleA, newScheduleB, oldScheduleA, oldSc
 	log.Println("Уведомления пользователям отправлены.")
 }
 
-// copyScheduleMap копирует мапу *ScheduleItem (копирует указатели)
+func sendNotificationForNewItems(chatID int64, corpus string, newItems map[string]*ScheduleItem) {
+	if len(newItems) == 0 {
+		return
+	}
+	headerMsg := tgbotapi.NewMessage(chatID, fmt.Sprintf("🔔 Появилось новое расписание для корпуса %s! Чтобы посмотреть, нажмите кнопку «Расписание %s»", corpus, corpus))
+	if _, err := bot.Send(headerMsg); err != nil {
+		log.Printf("Ошибка отправки уведомления пользователю %d: %v", chatID, err)
+	}
+}
+
 func copyScheduleMap(src map[string]*ScheduleItem) map[string]*ScheduleItem {
 	dst := make(map[string]*ScheduleItem, len(src))
 	for k, v := range src {
@@ -440,10 +385,8 @@ func copyScheduleMap(src map[string]*ScheduleItem) map[string]*ScheduleItem {
 	return dst
 }
 
-// sendSchedule отправляет пользователю все расписания корпуса
 func sendSchedule(chatID int64, corpus string) {
 	var scheduleMap map[string]*ScheduleItem
-
 	mu.RLock()
 	switch strings.ToUpper(corpus) {
 	case "A":
@@ -530,11 +473,12 @@ func sendSupportMessage(chatID int64) {
 	}
 }
 
-// scrapeImages собирает изображения с сайта, загружает новые изображения в Telegram для получения file_id и обновляет кэш
+// --- scrapeImages ---
 func scrapeImages() {
 	defer func() {
 		if r := recover(); r != nil {
 			log.Printf("Паника в скрапере: %v", r)
+			lastScrapeSuccess = false
 		}
 	}()
 
@@ -544,11 +488,9 @@ func scrapeImages() {
 	ctxLoad := context.Background()
 	oldScheduleA, oldScheduleB, err := loadScheduleCache(ctxLoad)
 	if err != nil {
-		log.Printf("Ошибка загрузки кэша расписания из БД: %v. Продолжаем с пустым кэшем.", err)
+		log.Printf("Ошибка загрузки кэша: %v. Продолжаем с пустым кэшем.", err)
 		oldScheduleA = make(map[string]*ScheduleItem)
 		oldScheduleB = make(map[string]*ScheduleItem)
-	} else {
-		log.Printf("Загружен кэш расписания: A=%d, B=%d", len(oldScheduleA), len(oldScheduleB))
 	}
 
 	c := colly.NewCollector(colly.Async(true))
@@ -558,164 +500,63 @@ func scrapeImages() {
 	tempScheduleA := make(map[string]*ScheduleItem)
 	tempScheduleB := make(map[string]*ScheduleItem)
 
-	// Регекс ожидает: /1Raspisanie/дд.мм(.гггг)?_korpus_[a|v].jpg
 	re := regexp.MustCompile(`/1Raspisanie/(\d{1,2})\.(\d{1,2})(?:\.(\d{4}))?_korpus_([av])\.jpe?g$`)
 
-	c.OnHTML(`img[src*="/1Raspisanie/"]`, func(e *colly.HTMLElement) {
-		imageSrc := e.Attr("src")
-		matches := re.FindStringSubmatch(imageSrc)
-		if len(matches) < 5 {
-			log.Printf("Пропущено: URL не соответствует формату %s", imageSrc)
+	c.OnHTML(`img`, func(e *colly.HTMLElement) {
+		src := e.Attr("src")
+		matches := re.FindStringSubmatch(src)
+		if len(matches) != 5 {
 			return
 		}
 		day, _ := strconv.Atoi(matches[1])
 		month, _ := strconv.Atoi(matches[2])
-		yearStr := matches[3]
-		corpusChar := matches[4]
-
 		year := time.Now().Year()
-		if yearStr != "" {
-			if y, err := strconv.Atoi(yearStr); err == nil {
-				year = y
-			}
+		if matches[3] != "" {
+			year, _ = strconv.Atoi(matches[3])
 		}
-
+		corpus := strings.ToLower(matches[4])
 		date := time.Date(year, time.Month(month), day, 0, 0, 0, 0, time.Local)
-		if !strings.HasPrefix(imageSrc, "/") {
-			imageSrc = "/" + imageSrc
-		}
-		fullURL := strings.TrimRight(baseSiteURL, "/") + imageSrc
 
-		item := &ScheduleItem{
-			URL:  fullURL,
-			Date: date,
-		}
-
-		var oldCache map[string]*ScheduleItem
-		var corpus string
-		if corpusChar == "a" {
-			oldCache = oldScheduleA
-			corpus = "a"
-		} else {
-			oldCache = oldScheduleB
-			corpus = "b"
-		}
-		if oldItem, exists := oldCache[fullURL]; exists && oldItem.FileID != "" {
-			item.FileID = oldItem.FileID
-			log.Printf("FileID для %s взят из кэша: %s", fullURL, item.FileID)
-		}
-
-		if corpus == "a" {
-			tempScheduleA[fullURL] = item
-			log.Printf("Найдено фото корпуса А: %s (%02d.%02d.%d)", fullURL, day, month, year)
-		} else {
-			tempScheduleB[fullURL] = item
-			log.Printf("Найдено фото корпуса Б: %s (%02d.%02d.%d)", fullURL, day, month, year)
+		item := &ScheduleItem{URL: baseSiteURL + src, Date: date}
+		switch corpus {
+		case "a":
+			tempScheduleA[item.URL] = item
+		case "b":
+			tempScheduleB[item.URL] = item
 		}
 	})
 
-	c.OnRequest(func(r *colly.Request) {
-		log.Printf("Visiting %s", r.URL.String())
-	})
-	c.OnError(func(r *colly.Response, err error) {
-		if r != nil && r.Request != nil {
-			log.Printf("Ошибка скрапинга %s: %v", r.Request.URL.String(), err)
-		} else {
-			log.Printf("Ошибка скрапинга: %v", err)
-		}
-	})
-
-	if err := c.Visit(strings.TrimRight(baseSiteURL, "/ ") + targetPath); err != nil {
-		log.Printf("Ошибка Visit: %v", err)
+	err = c.Visit(baseSiteURL + targetPath)
+	if err != nil {
+		log.Printf("Ошибка посещения сайта: %v", err)
+		lastScrapeSuccess = false
 		return
 	}
 	c.Wait()
 
-	// Функция загрузки фото в Telegram для получения file_id
-	uploadAndGetFileID := func(item *ScheduleItem) string {
-		uploadURL := fmt.Sprintf("%s?upload_cache_bust_scrape=%d", item.URL, time.Now().UnixNano())
-		log.Printf("Попытка загрузки %s (уникальный URL: %s) в чат %d", item.URL, uploadURL, adminChatID)
-		photo := tgbotapi.NewPhoto(adminChatID, tgbotapi.FileURL(uploadURL))
-		photo.DisableNotification = true
-		photo.Caption = fmt.Sprintf("[Кэширование] %s", item.URL)
-
-		msg, err := bot.Send(photo)
-		if err != nil {
-			log.Printf("Ошибка загрузки фото в Telegram (для кэширования) %s: %v", item.URL, err)
-			return ""
-		}
-		if len(msg.Photo) > 0 {
-			fileID := msg.Photo[len(msg.Photo)-1].FileID
-			log.Printf("Загружено и закэшировано фото %s -> FileID: %s", item.URL, fileID)
-			// Опционально можно удалить сообщение администратору, но это может требовать прав
-			return fileID
-		}
-		log.Printf("Ошибка: Сообщение с фото не содержит фото %s. Ответ от Telegram: %+v", item.URL, msg)
-		return ""
-	}
-
-	// Определяем новые элементы (которые были не в старом кэше)
-	newItemsA := findNewItems(tempScheduleA, oldScheduleA)
-	newItemsB := findNewItems(tempScheduleB, oldScheduleB)
-	log.Printf("Найдено новых изображений для загрузки: A=%d, B=%d", len(newItemsA), len(newItemsB))
-
-	uploadStart := time.Now()
-	var wgUpload sync.WaitGroup
-
-	// Параллельно загружаем (с лимитом)
-	limit := 5
-	semaA := make(chan struct{}, limit)
-	for _, item := range newItemsA {
-		if item.FileID == "" {
-			wgUpload.Add(1)
-			go func(it *ScheduleItem) {
-				defer wgUpload.Done()
-				semaA <- struct{}{}
-				defer func() { <-semaA }()
-				it.FileID = uploadAndGetFileID(it)
-			}(item)
-		}
-	}
-	wgUpload.Wait()
-
-	semaB := make(chan struct{}, limit)
-	for _, item := range newItemsB {
-		if item.FileID == "" {
-			wgUpload.Add(1)
-			go func(it *ScheduleItem) {
-				defer wgUpload.Done()
-				semaB <- struct{}{}
-				defer func() { <-semaB }()
-				it.FileID = uploadAndGetFileID(it)
-			}(item)
-		}
-	}
-	wgUpload.Wait()
-
-	log.Printf("Загрузка новых изображений завершена за %v", time.Since(uploadStart))
-
-	// Обновляем глобальные мапы
 	mu.Lock()
-	scheduleA = make(map[string]*ScheduleItem)
-	scheduleB = make(map[string]*ScheduleItem)
-	for k, v := range tempScheduleA {
-		scheduleA[k] = v
-	}
-	for k, v := range tempScheduleB {
-		scheduleB[k] = v
-	}
+	scheduleA = tempScheduleA
+	scheduleB = tempScheduleB
 	mu.Unlock()
 
-	// Сохраняем кэш в БД
-	ctxSave := context.Background()
-	if err := saveScheduleCache(ctxSave, scheduleA, scheduleB); err != nil {
-		log.Printf("Ошибка сохранения кэша расписания в БД: %v", err)
-	} else {
-		log.Println("Новый кэш расписания сохранен в БД.")
+	// Первый запуск — уведомления не отправляем
+	if len(oldScheduleA) == 0 && len(oldScheduleB) == 0 {
+		log.Println("Первый запуск скрапинга: уведомления не отправляются")
+		if err := saveScheduleCache(ctxLoad, scheduleA, scheduleB); err != nil {
+			log.Printf("Ошибка сохранения кэша после первого запуска: %v", err)
+		}
+		lastScrapeSuccess = true
+		return
 	}
 
-	log.Printf("Скрапинг и кэширование завершены, A=%d B=%d за %v", len(scheduleA), len(scheduleB), time.Since(start))
+	notifyUsersAboutNewSchedule(tempScheduleA, tempScheduleB, oldScheduleA, oldScheduleB)
 
-	// Уведомляем пользователей о новых элементах
-	notifyUsersAboutNewSchedule(scheduleA, scheduleB, oldScheduleA, oldScheduleB)
+	if err := saveScheduleCache(ctxLoad, scheduleA, scheduleB); err != nil {
+		log.Printf("Ошибка сохранения кэша после скрапинга: %v", err)
+		lastScrapeSuccess = false
+	} else {
+		lastScrapeSuccess = true
+	}
+
+	log.Printf("Скрапинг завершён за %s", time.Since(start))
 }
