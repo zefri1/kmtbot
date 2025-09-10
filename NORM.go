@@ -1,4 +1,3 @@
-// main.go
 package main
 
 import (
@@ -10,6 +9,7 @@ import (
 	"net/http"
 	_ "net/http/pprof"
 	"os"
+	"path"
 	"regexp"
 	"sort"
 	"strconv"
@@ -25,9 +25,10 @@ import (
 
 const (
 	webhookPath = "/webhook"
+	// Исправлено: убраны лишние пробелы
 	baseSiteURL = "https://kmtko.my1.ru"
 	targetPath  = "/index/raspisanie_zanjatij_ochno/0-403"
-	adminChatID = int64(6436017953)
+	// adminChatID = int64(6436017953) // Убрано, так как не используется напрямую в этом коде
 )
 
 type ScheduleItem struct {
@@ -37,12 +38,12 @@ type ScheduleItem struct {
 }
 
 var (
-	bot       *tgbotapi.BotAPI
-	db        *pgxpool.Pool
-	mu        sync.RWMutex
-	scheduleA = make(map[string]*ScheduleItem)
-	scheduleB = make(map[string]*ScheduleItem)
-	lastScrapeSuccess = false // <-- новая переменная для контроля успешного скрапинга
+	bot               *tgbotapi.BotAPI
+	db                *pgxpool.Pool
+	mu                sync.RWMutex
+	scheduleA         = make(map[string]*ScheduleItem)
+	scheduleB         = make(map[string]*ScheduleItem)
+	lastScrapeSuccess = false // Переменная для контроля успешного скрапинга
 )
 
 func main() {
@@ -110,8 +111,10 @@ func main() {
 	}()
 
 	go func() {
+		// Выполняем первый скрейпинг сразу при запуске
 		scrapeImages()
 		for {
+			// Затем каждые 30 минут
 			time.Sleep(30 * time.Minute)
 			scrapeImages()
 		}
@@ -322,12 +325,10 @@ func findNewItems(newMap, oldMap map[string]*ScheduleItem) map[string]*ScheduleI
 	return newItems
 }
 
-// --- исправлено: уведомления только если предыдущий скрап был успешным ---
+// --- Логика уведомлений ---
+// Уведомления отправляются, если текущий скрапинг успешен и найдены новые элементы.
 func notifyUsersAboutNewSchedule(newScheduleA, newScheduleB, oldScheduleA, oldScheduleB map[string]*ScheduleItem) {
-	if !lastScrapeSuccess {
-		log.Println("Предыдущий скрапинг не был успешным, уведомления не отправляем.")
-		return
-	}
+	// Убрано условие if !lastScrapeSuccess
 
 	newItemsA := findNewItems(newScheduleA, oldScheduleA)
 	newItemsB := findNewItems(newScheduleB, oldScheduleB)
@@ -346,6 +347,7 @@ func notifyUsersAboutNewSchedule(newScheduleA, newScheduleB, oldScheduleA, oldSc
 	}
 
 	var wg sync.WaitGroup
+	// Ограничитель для параллельных отправок
 	semaphore := make(chan struct{}, 10)
 
 	for _, userID := range userIDs {
@@ -371,12 +373,14 @@ func sendNotificationForNewItems(chatID int64, corpus string, newItems map[strin
 	if len(newItems) == 0 {
 		return
 	}
+	// Сообщение изменено для соответствия логике кнопок
 	headerMsg := tgbotapi.NewMessage(chatID, fmt.Sprintf("🔔 Появилось новое расписание для корпуса %s! Чтобы посмотреть, нажмите кнопку «Расписание %s»", corpus, corpus))
 	if _, err := bot.Send(headerMsg); err != nil {
 		log.Printf("Ошибка отправки уведомления пользователю %d: %v", chatID, err)
 	}
 }
 
+// --- Логика отправки расписания пользователю ---
 func copyScheduleMap(src map[string]*ScheduleItem) map[string]*ScheduleItem {
 	dst := make(map[string]*ScheduleItem, len(src))
 	for k, v := range src {
@@ -433,7 +437,9 @@ func sendSchedule(chatID int64, corpus string) {
 			photo := tgbotapi.NewPhoto(chatID, tgbotapi.FileID(it.FileID))
 			photo.Caption = caption
 			msg = photo
+			log.Printf("Отправка по FileID: %s -> chat %d (%s)", it.FileID, chatID, caption)
 		} else {
+			log.Printf("FileID отсутствует, отправка по URL: %s -> chat %d", it.URL, chatID)
 			uniqueURL := fmt.Sprintf("%s?send_cb=%d", it.URL, time.Now().UnixNano())
 			photo := tgbotapi.NewPhoto(chatID, tgbotapi.FileURL(uniqueURL))
 			photo.Caption = caption
@@ -445,7 +451,7 @@ func sendSchedule(chatID int64, corpus string) {
 		} else {
 			log.Printf("Успешно отправлено фото -> chat %d (%s)", chatID, caption)
 		}
-		time.Sleep(50 * time.Millisecond)
+		time.Sleep(50 * time.Millisecond) // Минимальная задержка
 	}
 }
 
@@ -473,7 +479,7 @@ func sendSupportMessage(chatID int64) {
 	}
 }
 
-// --- scrapeImages ---
+// --- scrapeImages с восстановленной логикой загрузки ---
 func scrapeImages() {
 	defer func() {
 		if r := recover(); r != nil {
@@ -483,80 +489,228 @@ func scrapeImages() {
 	}()
 
 	start := time.Now()
-	log.Println("Начало скрапинга...")
+	log.Println("=== Начало скрапинга ===")
 
+	// --- Загружаем предыдущий кэш ---
 	ctxLoad := context.Background()
 	oldScheduleA, oldScheduleB, err := loadScheduleCache(ctxLoad)
 	if err != nil {
 		log.Printf("Ошибка загрузки кэша: %v. Продолжаем с пустым кэшем.", err)
 		oldScheduleA = make(map[string]*ScheduleItem)
 		oldScheduleB = make(map[string]*ScheduleItem)
+	} else {
+		log.Printf("Загружен кэш расписания: A=%d, B=%d", len(oldScheduleA), len(oldScheduleB))
 	}
+	// --- Конец загрузки кэша ---
 
 	c := colly.NewCollector(colly.Async(true))
 	c.SetRequestTimeout(30 * time.Second)
 	c.Limit(&colly.LimitRule{DomainGlob: "*", Parallelism: 2, RandomDelay: 1 * time.Second})
 
+	// Временные мапы для хранения новых данных
 	tempScheduleA := make(map[string]*ScheduleItem)
 	tempScheduleB := make(map[string]*ScheduleItem)
 
+	// Регулярное выражение для парсинга URL расписаний
 	re := regexp.MustCompile(`/1Raspisanie/(\d{1,2})\.(\d{1,2})(?:\.(\d{4}))?_korpus_([av])\.jpe?g$`)
 
-	c.OnHTML(`img`, func(e *colly.HTMLElement) {
+	// Используем более точный селектор
+	c.OnHTML(`img[src*="/1Raspisanie/"]`, func(e *colly.HTMLElement) {
 		src := e.Attr("src")
 		matches := re.FindStringSubmatch(src)
 		if len(matches) != 5 {
+			// log.Printf("Несовпадение RE для %s", src) // Для отладки
 			return
 		}
 		day, _ := strconv.Atoi(matches[1])
 		month, _ := strconv.Atoi(matches[2])
+		yearStr := matches[3]
+		corpus := strings.ToLower(matches[4]) // 'a' или 'v' (как 'b')
+
+		// Определяем год
 		year := time.Now().Year()
-		if matches[3] != "" {
-			year, _ = strconv.Atoi(matches[3])
+		if yearStr != "" {
+			if parsedYear, err := strconv.Atoi(yearStr); err == nil {
+				year = parsedYear
+			}
 		}
-		corpus := strings.ToLower(matches[4])
+
+		// Создаем дату
 		date := time.Date(year, time.Month(month), day, 0, 0, 0, 0, time.Local)
 
-		item := &ScheduleItem{URL: baseSiteURL + src, Date: date}
-		switch corpus {
-		case "a":
+		// Формируем полный URL надежным способом
+		// Убедимся, что baseSiteURL не заканчивается на '/', а src начинается с '/'
+		fullURL := strings.TrimRight(baseSiteURL, "/") + path.Clean("/"+strings.TrimLeft(src, "/"))
+		// Альтернатива: fullURL := strings.TrimRight(baseSiteURL, "/") + "/" + strings.TrimLeft(src, "/")
+
+		// Создаем элемент расписания
+		item := &ScheduleItem{
+			URL:  fullURL,
+			Date: date,
+			// FileID будет заполнен позже или взят из кэша
+		}
+
+		// --- Попытка взять FileID из старого кэша ---
+		var oldCache map[string]*ScheduleItem
+		if corpus == "a" {
+			oldCache = oldScheduleA
+		} else { // corpus == "v" -> "b"
+			oldCache = oldScheduleB
+		}
+		if oldItem, exists := oldCache[item.URL]; exists && oldItem.FileID != "" {
+			item.FileID = oldItem.FileID // Используем существующий FileID
+			log.Printf("FileID для %s взят из кэша: %s", item.URL, item.FileID)
+		}
+		// --- Конец получения из кэша ---
+
+		// Добавляем во временные мапы
+		if corpus == "a" {
 			tempScheduleA[item.URL] = item
-		case "b":
+			log.Printf("Найдено фото корпуса А: %s (%02d.%02d.%d)", item.URL, day, month, year)
+		} else { // corpus == "v"
 			tempScheduleB[item.URL] = item
+			log.Printf("Найдено фото корпуса Б: %s (%02d.%02d.%d)", item.URL, day, month, year)
 		}
 	})
 
-	err = c.Visit(baseSiteURL + targetPath)
+	c.OnRequest(func(r *colly.Request) {
+		log.Printf("Visiting %s", r.URL.String())
+	})
+
+	c.OnError(func(r *colly.Response, err error) {
+		log.Printf("Ошибка скрапинга %s: %v", r.Request.URL.String(), err)
+	})
+
+	visitURL := strings.TrimRight(baseSiteURL, "/") + targetPath
+	log.Printf("Начинаем посещение: %s", visitURL)
+	err = c.Visit(visitURL)
 	if err != nil {
 		log.Printf("Ошибка посещения сайта: %v", err)
 		lastScrapeSuccess = false
 		return
 	}
 	c.Wait()
+	log.Println("Скрапинг HTML завершен.")
 
+	// --- Логика загрузки изображений в Telegram (только для новых) ---
+	log.Println("Начинаем загрузку новых изображений в Telegram...")
+	uploadStart := time.Now()
+
+	// Функция для загрузки и получения file_id
+	uploadAndGetFileID := func(item *ScheduleItem) string {
+		// Генерируем уникальный URL для загрузки (чтобы Telegram не использовал свой кэш)
+		uploadURL := fmt.Sprintf("%s?upload_cache_bust_scrape=%d", item.URL, time.Now().UnixNano())
+		log.Printf("DEBUG: Попытка загрузки %s (уникальный URL: %s) в чат администратора", item.URL, uploadURL)
+
+		// Создаем фото для отправки в чат администратора (замените на реальный ID чата)
+		// Для тестирования можно использовать ID тестового чата или ID бота
+		adminChatID := int64(6436017953) // Предполагаем, что это ID чата для кэширования
+		photo := tgbotapi.NewPhoto(adminChatID, tgbotapi.FileURL(uploadURL))
+		photo.DisableNotification = true // Не уведомлять администратора о сообщении
+		photo.Caption = fmt.Sprintf("[Кэширование] %s", item.URL) // Добавляем подпись для идентификации
+
+		msg, err := bot.Send(photo)
+		if err != nil {
+			log.Printf("Ошибка загрузки фото в Telegram (для кэширования) %s: %v", item.URL, err)
+			return "" // Возвращаем пустую строку в случае ошибки
+		}
+
+		log.Printf("DEBUG: Сообщение с фото отправлено в Telegram, MessageID: %d", msg.MessageID)
+		log.Printf("DEBUG: Длина msg.Photo: %d", len(msg.Photo))
+
+		// Получаем file_id из отправленного сообщения
+		if len(msg.Photo) > 0 {
+			// Берем фото с наилучшим качеством (обычно последний элемент)
+			fileID := msg.Photo[len(msg.Photo)-1].FileID
+			log.Printf("Загружено и закэшировано фото %s -> FileID: %s", item.URL, fileID)
+			// Пытаемся удалить сообщение, чтобы не засорять чат администратора
+			// _, delErr := bot.Send(tgbotapi.NewDeleteMessage(adminChatID, msg.MessageID))
+			// if delErr != nil {
+			// 	log.Printf("Предупреждение: Не удалось удалить сообщение %d: %v", msg.MessageID, delErr)
+			// } else {
+			// 	log.Printf("DEBUG: Сообщение %d удалено из чата администратора", msg.MessageID)
+			// }
+			return fileID
+		} else {
+			log.Printf("Ошибка: Сообщение с фото не содержит фото %s. Ответ от Telegram: %+v", item.URL, msg)
+			return ""
+		}
+	}
+
+	// --- Определяем и загружаем только новые изображения ---
+	// Определяем новые элементы
+	newItemsA := findNewItems(tempScheduleA, oldScheduleA)
+	newItemsB := findNewItems(tempScheduleB, oldScheduleB)
+
+	log.Printf("Найдено новых изображений для загрузки: A=%d, B=%d", len(newItemsA), len(newItemsB))
+
+	// Асинхронная загрузка новых изображений для корпуса A
+	var wgUpload sync.WaitGroup
+	semaphoreA := make(chan struct{}, 5) // Ограничиваем кол-во одновременных горутин
+	for _, item := range newItemsA {
+		if item.FileID == "" { // Загружаем только если FileID еще не установлен
+			wgUpload.Add(1)
+			go func(it *ScheduleItem) {
+				defer wgUpload.Done()
+				semaphoreA <- struct{}{}
+				defer func() { <-semaphoreA }()
+				it.FileID = uploadAndGetFileID(it)
+				// time.Sleep(50 * time.Millisecond) // Задержка внутри горутины, можно уменьшить или убрать
+			}(item)
+		}
+	}
+	wgUpload.Wait()
+
+	// Асинхронная загрузка новых изображений для корпуса B
+	semaphoreB := make(chan struct{}, 5)
+	for _, item := range newItemsB {
+		if item.FileID == "" {
+			wgUpload.Add(1)
+			go func(it *ScheduleItem) {
+				defer wgUpload.Done()
+				semaphoreB <- struct{}{}
+				defer func() { <-semaphoreB }()
+				it.FileID = uploadAndGetFileID(it)
+				// time.Sleep(50 * time.Millisecond)
+			}(item)
+		}
+	}
+	wgUpload.Wait() // Ждем завершения всех загрузок
+
+	log.Printf("Загрузка новых изображений завершена за %v", time.Since(uploadStart))
+	// --- Конец логики загрузки ---
+
+	// --- Обновляем глобальные мапы и сохраняем кэш ---
 	mu.Lock()
-	scheduleA = tempScheduleA
-	scheduleB = tempScheduleB
+	// Очищаем старые данные
+	scheduleA = make(map[string]*ScheduleItem)
+	scheduleB = make(map[string]*ScheduleItem)
+	// Копируем новые данные
+	for k, v := range tempScheduleA {
+		scheduleA[k] = v
+	}
+	for k, v := range tempScheduleB {
+		scheduleB[k] = v
+	}
 	mu.Unlock()
 
-	// Первый запуск — уведомления не отправляем
-	if len(oldScheduleA) == 0 && len(oldScheduleB) == 0 {
-		log.Println("Первый запуск скрапинга: уведомления не отправляются")
-		if err := saveScheduleCache(ctxLoad, scheduleA, scheduleB); err != nil {
-			log.Printf("Ошибка сохранения кэша после первого запуска: %v", err)
-		}
-		lastScrapeSuccess = true
-		return
-	}
-
-	notifyUsersAboutNewSchedule(tempScheduleA, tempScheduleB, oldScheduleA, oldScheduleB)
-
-	if err := saveScheduleCache(ctxLoad, scheduleA, scheduleB); err != nil {
-		log.Printf("Ошибка сохранения кэша после скрапинга: %v", err)
-		lastScrapeSuccess = false
+	// --- Сохраняем новый кэш в БД ---
+	ctxSave := context.Background()
+	if saveErr := saveScheduleCache(ctxSave, scheduleA, scheduleB); saveErr != nil {
+		log.Printf("Ошибка сохранения кэша после скрапинга: %v", saveErr)
+		lastScrapeSuccess = false // Устанавливаем false при ошибке сохранения
 	} else {
-		lastScrapeSuccess = true
+		log.Println("Новый кэш расписания успешно сохранен в БД.")
+		// --- Отправляем уведомления, если сохранение прошло успешно ---
+		// Первый запуск — уведомления не отправляем
+		if len(oldScheduleA) == 0 && len(oldScheduleB) == 0 {
+			log.Println("Первый запуск скрапинга: уведомления не отправляются")
+		} else {
+			notifyUsersAboutNewSchedule(scheduleA, scheduleB, oldScheduleA, oldScheduleB)
+		}
+		lastScrapeSuccess = true // Устанавливаем true, если дошли до этого места без критических ошибок
 	}
+	// --- Конец сохранения кэша и отправки уведомлений ---
 
-	log.Printf("Скрапинг завершён за %s", time.Since(start))
+	log.Printf("=== Скрапинг завершён за %s ===", time.Since(start))
 }
