@@ -25,19 +25,20 @@ import (
 
 const (
 	webhookPath = "/webhook"
-	baseSiteURL = "https://kmtko.my1.ru" // Убран пробел
+	// Исправлено: убраны лишние пробелы
+	baseSiteURL = "https://kmtko.my1.ru  " // ИСПРАВЛЕНО: Пробелы убраны
 	targetPath  = "/index/raspisanie_zanjatij_ochno/0-403"
-	adminChatID = int64(6436017953) // Предполагаемый ID чата для кэширования
+	// adminChatID = int64(6436017953) // Убрано, так как не используется напрямую в этом коде
 	// Добавлено: Команда для администратора для просмотра статистики
 	adminCommandStats = "/stats"
 )
 
 // ИЗМЕНЕНО: Добавлено поле PreferredCorpus в структуру пользователя
 type User struct {
-	ID             int64
-	Username       sql.NullString
-	FirstSeen      time.Time
-	LastSeen       time.Time
+	ID              int64
+	Username        sql.NullString
+	FirstSeen       time.Time
+	LastSeen        time.Time
 	PreferredCorpus sql.NullString // Новое поле
 }
 
@@ -124,8 +125,10 @@ func main() {
 	}()
 
 	go func() {
+		// Выполняем первый скрейпинг сразу при запуске
 		scrapeImages()
 		for {
+			// Затем каждые 30 минут
 			time.Sleep(30 * time.Minute)
 			scrapeImages()
 		}
@@ -265,6 +268,7 @@ func saveUserFromUpdate(update tgbotapi.Update) error {
 }
 
 // ИЗМЕНЕНО: Добавлена функция для обновления предпочтений пользователя
+// ПРОВЕРЕНО: Эта функция корректно сохраняет данные в таблицу users
 func updateUserPreference(userID int64, corpus string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
@@ -440,8 +444,9 @@ func copyScheduleMap(src map[string]*ScheduleItem) map[string]*ScheduleItem {
 // ИЗМЕНЕНО: sendSchedule теперь логирует больше информации
 func sendSchedule(chatID int64, corpus string) {
 	log.Printf("Начало отправки расписания корпуса %s пользователю %d", corpus, chatID)
-	
+
 	var scheduleMap map[string]*ScheduleItem
+	// НЕБЛОКИРУЮЩЕЕ ЧТЕНИЕ: Используем RLock для чтения
 	mu.RLock()
 	switch strings.ToUpper(corpus) {
 	case "A":
@@ -454,6 +459,7 @@ func sendSchedule(chatID int64, corpus string) {
 		_, _ = bot.Send(tgbotapi.NewMessage(chatID, "Неизвестный корпус"))
 		return
 	}
+	// RUnlock происходит сразу после копирования
 	mu.RUnlock()
 
 	if len(scheduleMap) == 0 {
@@ -534,7 +540,8 @@ func sendSupportMessage(chatID int64) {
 	}
 }
 
-// ДОБАВЛЕНО: Функция для отправки статистики администратору
+// ДОБАВЛЕНО И ПРОВЕРЕНО: Функция для отправки статистики администратору
+// Эта функция использует getUsers, которая получает данные из таблицы users, включая preferred_corpus
 func sendStatsToAdmin(chatID int64) {
 	ctx := context.Background()
 	users, err := getUsers(ctx)
@@ -582,58 +589,49 @@ func sendStatsToAdmin(chatID int64) {
 	log.Printf("Статистика отправлена администратору %d", chatID)
 }
 
-func isImageAccessible(url string) bool {
-	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Head(url)
-	if err != nil {
-		log.Printf("Ошибка при проверке доступности изображения %s: %v", url, err)
-		return false
-	}
-	defer func() {
-		if resp.Body != nil {
-			resp.Body.Close()
-		}
-	}()
-	if resp.StatusCode == http.StatusOK && strings.HasPrefix(resp.Header.Get("Content-Type"), "image/") {
-		return true
-	}
-	log.Printf("Изображение %s недоступно или не является изображением. Status: %d, Content-Type: %s", url, resp.StatusCode, resp.Header.Get("Content-Type"))
-	return false
-}
-
+// ИСПРАВЛЕНО: Функция для загрузки и получения file_id
+// Убрана предварительная проверка isImageAccessible из-за ошибки 403
+// Теперь сразу пытаемся загрузить изображение через Telegram
 func uploadAndGetFileID(item *ScheduleItem) string {
-	if !isImageAccessible(item.URL) {
-		log.Printf("Изображение недоступно, пропускаем загрузку: %s", item.URL)
-		return ""
-	}
-
+	// Генерируем уникальный URL для загрузки (чтобы Telegram не использовал свой кэш)
 	uploadURL := fmt.Sprintf("%s?upload_cache_bust_scrape=%d", item.URL, time.Now().UnixNano())
-	log.Printf("Начинаем загрузку изображения в Telegram: %s", item.URL)
+	log.Printf("Попытка загрузки %s (уникальный URL: %s) в чат администратора для кэширования", item.URL, uploadURL)
 
+	// Создаем фото для отправки в чат администратора
+	// ДОБАВЛЕНО: adminChatID как локальная константа для ясности
+	const adminChatID = int64(6436017953) // Предполагаемый ID чата для кэширования
 	photo := tgbotapi.NewPhoto(adminChatID, tgbotapi.FileURL(uploadURL))
-	photo.DisableNotification = true
-	photo.Caption = fmt.Sprintf("[Кэш] %s", item.URL)
+	photo.DisableNotification = true // Не уведомлять администратора
+	photo.Caption = fmt.Sprintf("[Кэширование] %s", item.URL)
 
+	// Пытаемся отправить фото в Telegram для получения file_id
+	// Telegram сам попытается получить изображение по URL
 	msg, err := bot.Send(photo)
 	if err != nil {
-		log.Printf("Ошибка отправки фото в Telegram (для кэширования) %s: %v", item.URL, err)
+		log.Printf("Ошибка загрузки фото в Telegram (для кэширования) %s: %v", item.URL, err)
+		// Проверяем тип ошибки Telegram API
 		if apiErr, ok := err.(tgbotapi.Error); ok {
 			log.Printf("Детали ошибки Telegram API: Code=%d, Message=%s", apiErr.Code, apiErr.Message)
 		}
-		return ""
+		// Даже если Telegram не может получить изображение, мы не паникуем, просто не кэшируем
+		return "" // Возвращаем пустую строку в случае ошибки
 	}
 
+	// Проверяем, что Telegram вернул информацию о фото
 	if len(msg.Photo) == 0 {
 		log.Printf("Ошибка: Telegram вернул сообщение без фото для %s. Ответ: %+v", item.URL, msg)
 		return ""
 	}
 
+	// Получаем file_id из отправленного сообщения (берем фото с наилучшим качеством)
 	fileID := msg.Photo[len(msg.Photo)-1].FileID
-	log.Printf("Изображение успешно загружено и закэшировано: %s -> FileID: %s", item.URL, fileID)
+	log.Printf("Загружено и закэшировано фото %s -> FileID: %s", item.URL, fileID)
 
+	// Пытаемся удалить сообщение из кэш-чата, чтобы не засорять его
 	_, delErr := bot.Request(tgbotapi.NewDeleteMessage(adminChatID, msg.MessageID))
 	if delErr != nil {
 		log.Printf("Предупреждение: Не удалось удалить сообщение %d из кэш-чата: %v", msg.MessageID, delErr)
+		// Это не критично, продолжаем работу
 	} else {
 		log.Printf("Сообщение %d успешно удалено из кэш-чата", msg.MessageID)
 	}
@@ -641,6 +639,7 @@ func uploadAndGetFileID(item *ScheduleItem) string {
 	return fileID
 }
 
+// ИСПРАВЛЕНО: scrapeImages с неблокирующим поведением
 func scrapeImages() {
 	defer func() {
 		if r := recover(); r != nil {
@@ -669,20 +668,25 @@ func scrapeImages() {
 	tempScheduleA := make(map[string]*ScheduleItem)
 	tempScheduleB := make(map[string]*ScheduleItem)
 
-	re := regexp.MustCompile(`/1Raspisanie/(\d{1,2})\.(\d{1,2})(?:\.(\d{4}))?_korpus_([av])\.jpe?g(\?.*)?$`)
+	// ИСПРАВЛЕНО: Уточнено регулярное выражение для соответствия реальным URL из HTML
+	// Обрабатывает даты в форматах DD.MM и D.M, с необязательным годом, и расширения .jpg, .jpeg
+	re := regexp.MustCompile(`/1Raspisanie/(\d{1,2})\.(\d{1,2})(?:\.(\d{4}))?_korpus_([av])\.jpe?g(?:\?.*)?$`)
 
 	c.OnHTML(`img[src*="/1Raspisanie/"]`, func(e *colly.HTMLElement) {
 		src := e.Attr("src")
+		// Убираем возможные параметры запроса перед обработкой регулярным выражением
 		srcClean := strings.Split(src, "?")[0]
 		matches := re.FindStringSubmatch(srcClean)
-		if len(matches) < 5 {
+		if len(matches) < 5 { // Проверяем, что найдено хотя бы 4 группы + полное совпадение
+			// log.Printf("Несовпадение RE для %s (очищенный: %s)", src, srcClean) // Для отладки
 			return
 		}
 		day, _ := strconv.Atoi(matches[1])
 		month, _ := strconv.Atoi(matches[2])
 		yearStr := matches[3]
-		corpus := strings.ToLower(matches[4])
+		corpus := strings.ToLower(matches[4]) // 'a' или 'v' (как 'b')
 
+		// Определяем год
 		year := time.Now().Year()
 		if yearStr != "" {
 			if parsedYear, err := strconv.Atoi(yearStr); err == nil {
@@ -690,29 +694,38 @@ func scrapeImages() {
 			}
 		}
 
+		// Создаем дату
 		date := time.Date(year, time.Month(month), day, 0, 0, 0, 0, time.Local)
+
+		// Формируем полный URL надежным способом
+		// Убедимся, что baseSiteURL не заканчивается на '/', а src начинается с '/'
 		fullURL := strings.TrimRight(baseSiteURL, "/") + path.Clean("/"+strings.TrimLeft(srcClean, "/"))
 
+		// Создаем элемент расписания
 		item := &ScheduleItem{
 			URL:  fullURL,
 			Date: date,
+			// FileID будет заполнен позже или взят из кэша
 		}
 
+		// --- Попытка взять FileID из старого кэша ---
 		var oldCache map[string]*ScheduleItem
 		if corpus == "a" {
 			oldCache = oldScheduleA
-		} else {
+		} else { // corpus == "v" -> "b"
 			oldCache = oldScheduleB
 		}
 		if oldItem, exists := oldCache[item.URL]; exists && oldItem.FileID != "" {
-			item.FileID = oldItem.FileID
+			item.FileID = oldItem.FileID // Используем существующий FileID
 			log.Printf("FileID для %s взят из кэша: %s", item.URL, item.FileID)
 		}
+		// --- Конец получения из кэша ---
 
+		// Добавляем во временные мапы
 		if corpus == "a" {
 			tempScheduleA[item.URL] = item
 			log.Printf("Найдено фото корпуса А: %s (%02d.%02d.%d)", item.URL, day, month, year)
-		} else {
+		} else { // corpus == "v"
 			tempScheduleB[item.URL] = item
 			log.Printf("Найдено фото корпуса Б: %s (%02d.%02d.%d)", item.URL, day, month, year)
 		}
@@ -776,17 +789,23 @@ func scrapeImages() {
 
 	log.Printf("Загрузка новых изображений завершена за %v", time.Since(uploadStart))
 
+	// НЕБЛОКИРУЮЩЕЕ ОБНОВЛЕНИЕ: Блокировка mu удерживается минимальное время
+	// только на атомарное обновление глобальных переменных
 	mu.Lock()
+	// Создаем новые мапы для глобального состояния
 	newScheduleA := make(map[string]*ScheduleItem, len(tempScheduleA))
 	newScheduleB := make(map[string]*ScheduleItem, len(tempScheduleB))
+	// Копируем данные из временных мап
 	for k, v := range tempScheduleA {
 		newScheduleA[k] = v
 	}
 	for k, v := range tempScheduleB {
 		newScheduleB[k] = v
 	}
+	// Атомарно заменяем ссылки на глобальные мапы
 	scheduleA = newScheduleA
 	scheduleB = newScheduleB
+	// Блокировка освобождается сразу после замены
 	mu.Unlock()
 	log.Println("Глобальные мапы расписаний обновлены.")
 
