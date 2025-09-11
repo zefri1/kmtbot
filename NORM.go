@@ -26,7 +26,7 @@ import (
 const (
 	webhookPath = "/webhook"
 	// Исправлено: убраны лишние пробелы
-	baseSiteURL = "https://kmtko.my1.ru  " // ИСПРАВЛЕНО: Пробелы убраны
+	baseSiteURL = "https://kmtko.my1.ru" // ИСПРАВЛЕНО: Пробелы убраны
 	targetPath  = "/index/raspisanie_zanjatij_ochno/0-403"
 	// adminChatID = int64(6436017953) // Убрано, так как не используется напрямую в этом коде
 	// Добавлено: Команда для администратора для просмотра статистики
