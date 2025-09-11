@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -25,21 +26,18 @@ import (
 
 const (
 	webhookPath = "/webhook"
-	// Исправлено: убраны лишние пробелы
-	baseSiteURL = "https://kmtko.my1.ru" // ИСПРАВЛЕНО: Пробелы убраны
+	baseSiteURL = "https://kmtko.my1.ru"
 	targetPath  = "/index/raspisanie_zanjatij_ochno/0-403"
-	// adminChatID = int64(6436017953) // Убрано, так как не используется напрямую в этом коде
-	// Добавлено: Команда для администратора для просмотра статистики
 	adminCommandStats = "/stats"
 )
 
-// ИЗМЕНЕНО: Добавлено поле PreferredCorpus в структуру пользователя
+// User struct
 type User struct {
 	ID              int64
 	Username        sql.NullString
 	FirstSeen       time.Time
 	LastSeen        time.Time
-	PreferredCorpus sql.NullString // Новое поле
+	PreferredCorpus sql.NullString
 }
 
 type ScheduleItem struct {
@@ -55,10 +53,114 @@ var (
 	scheduleA         = make(map[string]*ScheduleItem)
 	scheduleB         = make(map[string]*ScheduleItem)
 	lastScrapeSuccess = false
-	// ИЗМЕНЕНО: Убедитесь, что тип int64 и значение заменено на ваш реальный ID
-	adminUserID int64 = 535803934 // Замените на реальный ID админа
+	adminUserID int64 = 535803934 // замените на реальный 
 )
 
+// --- Новые типы и очереди отправки ---
+type sendResponse struct {
+	Message *tgbotapi.Message
+	Err     error
+}
+
+type sendTask struct {
+	Chattable tgbotapi.Chattable
+	Resp      chan sendResponse // nil -> fire-and-forget
+}
+
+var (
+	userSendQueue   chan sendTask
+	uploaderQueue   chan sendTask
+)
+
+// startSenderPool запускает воркеры для очереди
+func startSenderPool(workers int, queue chan sendTask) {
+	for i := 0; i < workers; i++ {
+		go func(id int) {
+			for task := range queue {
+				// Захватываем и отправляем напрямую через bot.Send
+				msg, err := bot.Send(task.Chattable)
+				if task.Resp != nil {
+					// Отправляем результат в канал (не блокируем)
+					select {
+					case task.Resp <- sendResponse{Message: &msg, Err: err}:
+					default:
+					}
+				}
+			}
+		}(i)
+	}
+}
+
+// enqueueUserSend ставит задачу в очередь userSendQueue и ждёт ответ (timeout)
+func enqueueUserSend(msg tgbotapi.Chattable, timeout time.Duration) (*tgbotapi.Message, error) {
+	if userSendQueue == nil {
+		return nil, errors.New("userSendQueue not initialized")
+	}
+	resp := make(chan sendResponse, 1)
+	task := sendTask{Chattable: msg, Resp: resp}
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
+	select {
+	case userSendQueue <- task:
+		// ждём результат
+		select {
+		case r := <-resp:
+			return r.Message, r.Err
+		case <-timer.C:
+			return nil, errors.New("user send timeout")
+		}
+	case <-timer.C:
+		return nil, errors.New("enqueue user send timeout")
+	}
+}
+
+// enqueueUploadSend ставит задачу в uploaderQueue и ждёт результат (более длинный timeout)
+func enqueueUploadSend(msg tgbotapi.Chattable, timeout time.Duration) (*tgbotapi.Message, error) {
+	if uploaderQueue == nil {
+		return nil, errors.New("uploaderQueue not initialized")
+	}
+	resp := make(chan sendResponse, 1)
+	task := sendTask{Chattable: msg, Resp: resp}
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
+	select {
+	case uploaderQueue <- task:
+		select {
+		case r := <-resp:
+			return r.Message, r.Err
+		case <-timer.C:
+			return nil, errors.New("uploader send timeout")
+		}
+	case <-timer.C:
+		return nil, errors.New("enqueue uploader send timeout")
+	}
+}
+
+// enqueueFireAndForget ставит задачу в выбранную очередь без ожидания результата
+func enqueueFireAndForget(msg tgbotapi.Chattable, forUser bool) error {
+	task := sendTask{Chattable: msg, Resp: nil}
+	if forUser {
+		select {
+		case userSendQueue <- task:
+			return nil
+		default:
+			return errors.New("user queue full")
+		}
+	} else {
+		select {
+		case uploaderQueue <- task:
+			return nil
+		default:
+			return errors.New("uploader queue full")
+		}
+	}
+}
+
+// ----------------- main -----------------
 func main() {
 	telegramToken := os.Getenv("TELEGRAM_TOKEN")
 	if telegramToken == "" {
@@ -89,7 +191,6 @@ func main() {
 	}
 	log.Println("Успешно подключились к Postgres")
 
-	// ИЗМЕНЕНО: ensureUsersTable обновлена
 	if err := ensureUsersTable(ctx); err != nil {
 		log.Fatalf("ensureUsersTable: %v", err)
 	}
@@ -102,6 +203,14 @@ func main() {
 		log.Fatalf("Ошибка при создании бота: %v", err)
 	}
 	log.Printf("Авторизован как: %s", bot.Self.UserName)
+
+	// Инициализируем очереди и воркеры после создания bot
+	userSendQueue = make(chan sendTask, 400)  // буфер для быстрых отправок
+	uploaderQueue = make(chan sendTask, 200)  // буфер для фоновых загрузок
+
+	// Воркеры: отдельно для пользователей и для загрузчиков
+	startSenderPool(12, userSendQueue)   // для пользовательских отправок (больше)
+	startSenderPool(6, uploaderQueue)    // для фоновых загрузок (умереннее)
 
 	externalURL := os.Getenv("RENDER_EXTERNAL_URL")
 	if externalURL == "" {
@@ -128,7 +237,6 @@ func main() {
 		// Выполняем первый скрейпинг сразу при запуске
 		scrapeImages()
 		for {
-			// Затем каждые 30 минут
 			time.Sleep(30 * time.Minute)
 			scrapeImages()
 		}
@@ -162,7 +270,7 @@ func main() {
 	log.Fatal(http.ListenAndServe(":"+port, nil))
 }
 
-// ИЗМЕНЕНО: ensureUsersTable теперь включает preferred_corpus
+// ----------------- DB / Users / Cache -----------------
 func ensureUsersTable(ctx context.Context) error {
 	_, err := db.Exec(ctx, `
 	CREATE TABLE IF NOT EXISTS users (
@@ -170,7 +278,7 @@ func ensureUsersTable(ctx context.Context) error {
 	  username TEXT,
 	  first_seen TIMESTAMPTZ DEFAULT now(),
 	  last_seen TIMESTAMPTZ DEFAULT now(),
-	  preferred_corpus TEXT -- Новое поле
+	  preferred_corpus TEXT
 	);
 	`)
 	return err
@@ -211,13 +319,10 @@ func processUpdate(update tgbotapi.Update) {
 		case "start":
 			sendStartMessage(update.Message.Chat.ID)
 		case "stats":
-			// Добавлено: Обработка команды /stats
-			// ИЗМЕНЕНО: правильное сравнение типов int64
 			if update.Message.From != nil && update.Message.From.ID == adminUserID {
 				go sendStatsToAdmin(update.Message.Chat.ID)
 			} else {
-				msg := tgbotapi.NewMessage(update.Message.Chat.ID, "У вас нет доступа к этой команде.")
-				_, _ = bot.Send(msg)
+				_, _ = enqueueUserSend(tgbotapi.NewMessage(update.Message.Chat.ID, "У вас нет доступа к этой команде."), 3*time.Second)
 			}
 		}
 	} else if update.Message != nil && update.Message.Text != "" {
@@ -225,22 +330,19 @@ func processUpdate(update tgbotapi.Update) {
 		case "Расписание А":
 			log.Printf("Пользователь %d (%s) запросил расписание корпуса А", update.Message.From.ID, update.Message.From.UserName)
 			sendSchedule(update.Message.Chat.ID, "A")
-			// ИЗМЕНЕНО: Обновляем предпочтение пользователя
 			if err := updateUserPreference(update.Message.From.ID, "A"); err != nil {
 				log.Printf("Ошибка обновления предпочтения пользователя %d: %v", update.Message.From.ID, err)
 			}
 		case "Расписание Б":
 			log.Printf("Пользователь %d (%s) запросил расписание корпуса Б", update.Message.From.ID, update.Message.From.UserName)
 			sendSchedule(update.Message.Chat.ID, "B")
-			// ИЗМЕНЕНО: Обновляем предпочтение пользователя
 			if err := updateUserPreference(update.Message.From.ID, "B"); err != nil {
 				log.Printf("Ошибка обновления предпочтения пользователя %d: %v", update.Message.From.ID, err)
 			}
 		case "Поддержка и предложения":
 			sendSupportMessage(update.Message.Chat.ID)
 		default:
-			msg := tgbotapi.NewMessage(update.Message.Chat.ID, "Выберите кнопку на клавиатуре или напишите команду /start")
-			_, _ = bot.Send(msg)
+			_, _ = enqueueUserSend(tgbotapi.NewMessage(update.Message.Chat.ID, "Выберите кнопку на клавиатуре или напишите команду /start"), 3*time.Second)
 		}
 	}
 }
@@ -267,8 +369,6 @@ func saveUserFromUpdate(update tgbotapi.Update) error {
 	return nil
 }
 
-// ИЗМЕНЕНО: Добавлена функция для обновления предпочтений пользователя
-// ПРОВЕРЕНО: Эта функция корректно сохраняет данные в таблицу users
 func updateUserPreference(userID int64, corpus string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
@@ -283,7 +383,6 @@ func updateUserPreference(userID int64, corpus string) error {
 	return nil
 }
 
-// ИЗМЕНЕНО: Обновлена функция getUsers для возврата структуры User
 func getUsers(ctx context.Context) ([]User, error) {
 	rows, err := db.Query(ctx, "SELECT id, username, first_seen, last_seen, preferred_corpus FROM users")
 	if err != nil {
@@ -383,6 +482,7 @@ func findNewItems(newMap, oldMap map[string]*ScheduleItem) map[string]*ScheduleI
 	return newItems
 }
 
+// notifyUsersAboutNewSchedule теперь учитывает preferred_corpus и не блокирует
 func notifyUsersAboutNewSchedule(newScheduleA, newScheduleB, oldScheduleA, oldScheduleB map[string]*ScheduleItem) {
 	newItemsA := findNewItems(newScheduleA, oldScheduleA)
 	newItemsB := findNewItems(newScheduleB, oldScheduleB)
@@ -394,7 +494,6 @@ func notifyUsersAboutNewSchedule(newScheduleA, newScheduleB, oldScheduleA, oldSc
 	log.Printf("Найдено новых расписаний: A=%d, B=%d. Начинаем уведомление пользователей.", len(newItemsA), len(newItemsB))
 
 	ctx := context.Background()
-	// ИЗМЕНЕНО: Используем getUsers вместо getUsersIDs
 	users, err := getUsers(ctx)
 	if err != nil {
 		log.Printf("Ошибка получения списка пользователей: %v", err)
@@ -402,7 +501,7 @@ func notifyUsersAboutNewSchedule(newScheduleA, newScheduleB, oldScheduleA, oldSc
 	}
 
 	var wg sync.WaitGroup
-	semaphore := make(chan struct{}, 10)
+	semaphore := make(chan struct{}, 10) // ограничение параллельных рассылок
 
 	for _, user := range users {
 		wg.Add(1)
@@ -411,6 +510,29 @@ func notifyUsersAboutNewSchedule(newScheduleA, newScheduleB, oldScheduleA, oldSc
 			semaphore <- struct{}{}
 			defer func() { <-semaphore }()
 
+			// Если пользователь указал предпочтение — шлём только ему
+			if u.PreferredCorpus.Valid {
+				switch strings.ToUpper(u.PreferredCorpus.String) {
+				case "A":
+					if len(newItemsA) > 0 {
+						sendNotificationForNewItems(u.ID, "А", newItemsA)
+					}
+				case "B":
+					if len(newItemsB) > 0 {
+						sendNotificationForNewItems(u.ID, "Б", newItemsB)
+					}
+				default:
+					if len(newItemsA) > 0 {
+						sendNotificationForNewItems(u.ID, "А", newItemsA)
+					}
+					if len(newItemsB) > 0 {
+						sendNotificationForNewItems(u.ID, "Б", newItemsB)
+					}
+				}
+				return
+			}
+
+			// Если предпочтений нет — шлём только корпус(ы), которые появились
 			if len(newItemsA) > 0 {
 				sendNotificationForNewItems(u.ID, "А", newItemsA)
 			}
@@ -427,9 +549,12 @@ func sendNotificationForNewItems(chatID int64, corpus string, newItems map[strin
 	if len(newItems) == 0 {
 		return
 	}
+	// используем enqueueUserSend с небольшим таймаутом
 	headerMsg := tgbotapi.NewMessage(chatID, fmt.Sprintf("🔔 Появилось новое расписание для корпуса %s! Чтобы посмотреть, нажмите кнопку «Расписание %s»", corpus, corpus))
-	if _, err := bot.Send(headerMsg); err != nil {
-		log.Printf("Ошибка отправки уведомления пользователю %d: %v", chatID, err)
+	if _, err := enqueueUserSend(headerMsg, 6*time.Second); err != nil {
+		// Если не удалось отправить синхронно, делаем fire-and-forget в очередь
+		_ = enqueueFireAndForget(headerMsg, true)
+		log.Printf("Ошибка отправки уведомления пользователю %d: %v (falling back to fire-and-forget)", chatID, err)
 	}
 }
 
@@ -441,12 +566,10 @@ func copyScheduleMap(src map[string]*ScheduleItem) map[string]*ScheduleItem {
 	return dst
 }
 
-// ИЗМЕНЕНО: sendSchedule теперь логирует больше информации
 func sendSchedule(chatID int64, corpus string) {
 	log.Printf("Начало отправки расписания корпуса %s пользователю %d", corpus, chatID)
 
 	var scheduleMap map[string]*ScheduleItem
-	// НЕБЛОКИРУЮЩЕЕ ЧТЕНИЕ: Используем RLock для чтения
 	mu.RLock()
 	switch strings.ToUpper(corpus) {
 	case "A":
@@ -456,15 +579,14 @@ func sendSchedule(chatID int64, corpus string) {
 	default:
 		mu.RUnlock()
 		log.Printf("Неизвестный корпус '%s' для пользователя %d", corpus, chatID)
-		_, _ = bot.Send(tgbotapi.NewMessage(chatID, "Неизвестный корпус"))
+		_, _ = enqueueUserSend(tgbotapi.NewMessage(chatID, "Неизвестный корпус"), 3*time.Second)
 		return
 	}
-	// RUnlock происходит сразу после копирования
 	mu.RUnlock()
 
 	if len(scheduleMap) == 0 {
 		log.Printf("Расписание корпуса %s не найдено для пользователя %d", corpus, chatID)
-		_, _ = bot.Send(tgbotapi.NewMessage(chatID, "Расписание не найдено."))
+		_, _ = enqueueUserSend(tgbotapi.NewMessage(chatID, "Расписание не найдено."), 3*time.Second)
 		return
 	}
 
@@ -488,7 +610,13 @@ func sendSchedule(chatID int64, corpus string) {
 	}
 
 	log.Printf("Отправка %d изображений расписания корпуса %s пользователю %d", len(items), corpus, chatID)
+
+	// rate limit отправки для одного пользователя, чтобы не вызывать ограничение Telegram
+	ticker := time.NewTicker(60 * time.Millisecond)
+	defer ticker.Stop()
+
 	for i, it := range items {
+		<-ticker.C
 		weekday := weekdays[it.Date.Weekday()]
 		caption := fmt.Sprintf("%s — %02d.%02d.%d", weekday, it.Date.Day(), it.Date.Month(), it.Date.Year())
 
@@ -499,19 +627,19 @@ func sendSchedule(chatID int64, corpus string) {
 			msg = photo
 			log.Printf("Отправка по FileID: %s -> chat %d (%s) [элемент %d/%d]", it.FileID, chatID, caption, i+1, len(items))
 		} else {
-			log.Printf("FileID отсутствует, отправка по URL: %s -> chat %d [элемент %d/%d]", it.URL, chatID, i+1, len(items))
 			uniqueURL := fmt.Sprintf("%s?send_cb=%d", it.URL, time.Now().UnixNano())
 			photo := tgbotapi.NewPhoto(chatID, tgbotapi.FileURL(uniqueURL))
 			photo.Caption = caption
 			msg = photo
+			log.Printf("FileID отсутствует, отправка по URL: %s -> chat %d [элемент %d/%d]", it.URL, chatID, i+1, len(items))
 		}
 
-		if _, err := bot.Send(msg); err != nil {
-			log.Printf("Ошибка отправки фото (URL: %s, FileID: %s) пользователю %d: %v", it.URL, it.FileID, chatID, err)
-		} else {
-			log.Printf("Успешно отправлено фото -> chat %d (%s) [элемент %d/%d]", chatID, caption, i+1, len(items))
+		// Синхронная отправка с адекватным таймаутом
+		if _, err := enqueueUserSend(msg, 20*time.Second); err != nil {
+			// fallback: fire-and-forget
+			_ = enqueueFireAndForget(msg, true)
+			log.Printf("Ошибка отправки фото (chat %d): %v (перешли в fire-and-forget)", chatID, err)
 		}
-		time.Sleep(50 * time.Millisecond)
 	}
 	log.Printf("Завершена отправка расписания корпуса %s пользователю %d", corpus, chatID)
 }
@@ -528,31 +656,33 @@ func sendStartMessage(chatID int64) {
 		),
 	)
 	msg.ReplyMarkup = keyboard
-	if _, err := bot.Send(msg); err != nil {
-		log.Printf("sendStartMessage err: %v", err)
+	if _, err := enqueueUserSend(msg, 5*time.Second); err != nil {
+		log.Printf("sendStartMessage enqueue err: %v. Попытка прямой отправки.", err)
+		if _, e := bot.Send(msg); e != nil {
+			log.Printf("sendStartMessage fallback bot.Send err: %v", e)
+		}
 	}
 }
 
 func sendSupportMessage(chatID int64) {
 	msg := tgbotapi.NewMessage(chatID, "По вопросам поддержки: @podkmt")
-	if _, err := bot.Send(msg); err != nil {
-		log.Printf("sendSupportMessage err: %v", err)
+	if _, err := enqueueUserSend(msg, 5*time.Second); err != nil {
+		log.Printf("sendSupportMessage enqueue err: %v. Попытка прямой отправки.", err)
+		if _, e := bot.Send(msg); e != nil {
+			log.Printf("sendSupportMessage fallback bot.Send err: %v", e)
+		}
 	}
 }
 
-// ДОБАВЛЕНО И ПРОВЕРЕНО: Функция для отправки статистики администратору
-// Эта функция использует getUsers, которая получает данные из таблицы users, включая preferred_corpus
 func sendStatsToAdmin(chatID int64) {
 	ctx := context.Background()
 	users, err := getUsers(ctx)
 	if err != nil {
 		log.Printf("Ошибка получения пользователей для статистики: %v", err)
-		msg := tgbotapi.NewMessage(chatID, "Ошибка получения статистики.")
-		_, _ = bot.Send(msg)
+		_, _ = enqueueUserSend(tgbotapi.NewMessage(chatID, "Ошибка получения статистики."), 3*time.Second)
 		return
 	}
 
-	// Подсчет предпочтений
 	corpusACount := 0
 	corpusBCount := 0
 	noPreferenceCount := 0
@@ -582,64 +712,43 @@ func sendStatsToAdmin(chatID int64) {
 	)
 
 	msg := tgbotapi.NewMessage(chatID, statsText)
-	_, err = bot.Send(msg)
-	if err != nil {
+	if _, err := enqueueUserSend(msg, 5*time.Second); err != nil {
 		log.Printf("Ошибка отправки статистики админу %d: %v", chatID, err)
 	}
-	log.Printf("Статистика отправлена администратору %d", chatID)
 }
 
-// ИСПРАВЛЕНО: Функция для загрузки и получения file_id
-// Убрана предварительная проверка isImageAccessible из-за ошибки 403
-// Теперь сразу пытаемся загрузить изображение через Telegram
+// uploadAndGetFileID теперь использует uploaderQueue и возвращает file_id, не блокируя остальную логику
 func uploadAndGetFileID(item *ScheduleItem) string {
-	// Генерируем уникальный URL для загрузки (чтобы Telegram не использовал свой кэш)
 	uploadURL := fmt.Sprintf("%s?upload_cache_bust_scrape=%d", item.URL, time.Now().UnixNano())
-	log.Printf("Попытка загрузки %s (уникальный URL: %s) в чат администратора для кэширования", item.URL, uploadURL)
+	const adminChatID = int64(6436017953) // чат для кэширования — при необходимости замените6436017953
 
-	// Создаем фото для отправки в чат администратора
-	// ДОБАВЛЕНО: adminChatID как локальная константа для ясности
-	const adminChatID = int64(6436017953) // Предполагаемый ID чата для кэширования
 	photo := tgbotapi.NewPhoto(adminChatID, tgbotapi.FileURL(uploadURL))
-	photo.DisableNotification = true // Не уведомлять администратора
+	photo.DisableNotification = true
 	photo.Caption = fmt.Sprintf("[Кэширование] %s", item.URL)
 
-	// Пытаемся отправить фото в Telegram для получения file_id
-	// Telegram сам попытается получить изображение по URL
-	msg, err := bot.Send(photo)
+	// Ставим в uploaderQueue и ждём результат (длинный таймаут)
+	msg, err := enqueueUploadSend(photo, 35*time.Second)
 	if err != nil {
 		log.Printf("Ошибка загрузки фото в Telegram (для кэширования) %s: %v", item.URL, err)
-		// Проверяем тип ошибки Telegram API
-		if apiErr, ok := err.(tgbotapi.Error); ok {
-			log.Printf("Детали ошибки Telegram API: Code=%d, Message=%s", apiErr.Code, apiErr.Message)
-		}
-		// Даже если Telegram не может получить изображение, мы не паникуем, просто не кэшируем
-		return "" // Возвращаем пустую строку в случае ошибки
+		return ""
 	}
-
-	// Проверяем, что Telegram вернул информацию о фото
-	if len(msg.Photo) == 0 {
-		log.Printf("Ошибка: Telegram вернул сообщение без фото для %s. Ответ: %+v", item.URL, msg)
+	if msg == nil || len(msg.Photo) == 0 {
+		log.Printf("Telegram вернул сообщение без фото для %s. Ответ: %+v", item.URL, msg)
 		return ""
 	}
 
-	// Получаем file_id из отправленного сообщения (берем фото с наилучшим качеством)
 	fileID := msg.Photo[len(msg.Photo)-1].FileID
 	log.Printf("Загружено и закэшировано фото %s -> FileID: %s", item.URL, fileID)
 
-	// Пытаемся удалить сообщение из кэш-чата, чтобы не засорять его
-	_, delErr := bot.Request(tgbotapi.NewDeleteMessage(adminChatID, msg.MessageID))
-	if delErr != nil {
-		log.Printf("Предупреждение: Не удалось удалить сообщение %d из кэш-чата: %v", msg.MessageID, delErr)
-		// Это не критично, продолжаем работу
-	} else {
-		log.Printf("Сообщение %d успешно удалено из кэш-чата", msg.MessageID)
-	}
+	// Попытка удалить сообщение из кэш-чата (fire-and-forget)
+	go func(chatID int64, messageID int) {
+		_, _ = bot.Request(tgbotapi.NewDeleteMessage(chatID, messageID))
+	}(adminChatID, msg.MessageID)
 
 	return fileID
 }
 
-// ИСПРАВЛЕНО: scrapeImages с неблокирующим поведением
+// scrapeImages (как раньше) — но теперь uploadAndGetFileID асинхронен через uploaderQueue
 func scrapeImages() {
 	defer func() {
 		if r := recover(); r != nil {
@@ -668,17 +777,13 @@ func scrapeImages() {
 	tempScheduleA := make(map[string]*ScheduleItem)
 	tempScheduleB := make(map[string]*ScheduleItem)
 
-	// ИСПРАВЛЕНО: Уточнено регулярное выражение для соответствия реальным URL из HTML
-	// Обрабатывает даты в форматах DD.MM и D.M, с необязательным годом, и расширения .jpg, .jpeg
 	re := regexp.MustCompile(`/1Raspisanie/(\d{1,2})\.(\d{1,2})(?:\.(\d{4}))?_korpus_([av])\.jpe?g(?:\?.*)?$`)
 
 	c.OnHTML(`img[src*="/1Raspisanie/"]`, func(e *colly.HTMLElement) {
 		src := e.Attr("src")
-		// Убираем возможные параметры запроса перед обработкой регулярным выражением
 		srcClean := strings.Split(src, "?")[0]
 		matches := re.FindStringSubmatch(srcClean)
-		if len(matches) < 5 { // Проверяем, что найдено хотя бы 4 группы + полное совпадение
-			// log.Printf("Несовпадение RE для %s (очищенный: %s)", src, srcClean) // Для отладки
+		if len(matches) < 5 {
 			return
 		}
 		day, _ := strconv.Atoi(matches[1])
@@ -686,7 +791,6 @@ func scrapeImages() {
 		yearStr := matches[3]
 		corpus := strings.ToLower(matches[4]) // 'a' или 'v' (как 'b')
 
-		// Определяем год
 		year := time.Now().Year()
 		if yearStr != "" {
 			if parsedYear, err := strconv.Atoi(yearStr); err == nil {
@@ -694,38 +798,29 @@ func scrapeImages() {
 			}
 		}
 
-		// Создаем дату
 		date := time.Date(year, time.Month(month), day, 0, 0, 0, 0, time.Local)
-
-		// Формируем полный URL надежным способом
-		// Убедимся, что baseSiteURL не заканчивается на '/', а src начинается с '/'
 		fullURL := strings.TrimRight(baseSiteURL, "/") + path.Clean("/"+strings.TrimLeft(srcClean, "/"))
 
-		// Создаем элемент расписания
 		item := &ScheduleItem{
 			URL:  fullURL,
 			Date: date,
-			// FileID будет заполнен позже или взят из кэша
 		}
 
-		// --- Попытка взять FileID из старого кэша ---
 		var oldCache map[string]*ScheduleItem
 		if corpus == "a" {
 			oldCache = oldScheduleA
-		} else { // corpus == "v" -> "b"
+		} else {
 			oldCache = oldScheduleB
 		}
 		if oldItem, exists := oldCache[item.URL]; exists && oldItem.FileID != "" {
-			item.FileID = oldItem.FileID // Используем существующий FileID
+			item.FileID = oldItem.FileID
 			log.Printf("FileID для %s взят из кэша: %s", item.URL, item.FileID)
 		}
-		// --- Конец получения из кэша ---
 
-		// Добавляем во временные мапы
 		if corpus == "a" {
 			tempScheduleA[item.URL] = item
 			log.Printf("Найдено фото корпуса А: %s (%02d.%02d.%d)", item.URL, day, month, year)
-		} else { // corpus == "v"
+		} else {
 			tempScheduleB[item.URL] = item
 			log.Printf("Найдено фото корпуса Б: %s (%02d.%02d.%d)", item.URL, day, month, year)
 		}
@@ -759,28 +854,27 @@ func scrapeImages() {
 	log.Printf("Найдено новых изображений для загрузки: A=%d, B=%d", len(newItemsA), len(newItemsB))
 
 	var wgUpload sync.WaitGroup
-	semaphoreA := make(chan struct{}, 2)
+	// Используем семафоры для ограничения одновременных загрузок (еще плюс к пулу)
+	semaphore := make(chan struct{}, 4) // общий лимит параллельных загрузок
+
 	for _, item := range newItemsA {
 		if item.FileID == "" {
 			wgUpload.Add(1)
 			go func(it *ScheduleItem) {
 				defer wgUpload.Done()
-				semaphoreA <- struct{}{}
-				defer func() { <-semaphoreA }()
+				semaphore <- struct{}{}
+				defer func() { <-semaphore }()
 				it.FileID = uploadAndGetFileID(it)
 			}(item)
 		}
 	}
-	wgUpload.Wait()
-
-	semaphoreB := make(chan struct{}, 2)
 	for _, item := range newItemsB {
 		if item.FileID == "" {
 			wgUpload.Add(1)
 			go func(it *ScheduleItem) {
 				defer wgUpload.Done()
-				semaphoreB <- struct{}{}
-				defer func() { <-semaphoreB }()
+				semaphore <- struct{}{}
+				defer func() { <-semaphore }()
 				it.FileID = uploadAndGetFileID(it)
 			}(item)
 		}
@@ -789,23 +883,17 @@ func scrapeImages() {
 
 	log.Printf("Загрузка новых изображений завершена за %v", time.Since(uploadStart))
 
-	// НЕБЛОКИРУЮЩЕЕ ОБНОВЛЕНИЕ: Блокировка mu удерживается минимальное время
-	// только на атомарное обновление глобальных переменных
 	mu.Lock()
-	// Создаем новые мапы для глобального состояния
 	newScheduleA := make(map[string]*ScheduleItem, len(tempScheduleA))
 	newScheduleB := make(map[string]*ScheduleItem, len(tempScheduleB))
-	// Копируем данные из временных мап
 	for k, v := range tempScheduleA {
 		newScheduleA[k] = v
 	}
 	for k, v := range tempScheduleB {
 		newScheduleB[k] = v
 	}
-	// Атомарно заменяем ссылки на глобальные мапы
 	scheduleA = newScheduleA
 	scheduleB = newScheduleB
-	// Блокировка освобождается сразу после замены
 	mu.Unlock()
 	log.Println("Глобальные мапы расписаний обновлены.")
 
