@@ -43,7 +43,7 @@ type User struct {
 type ScheduleItem struct {
     URL        string
     Date       time.Time
-    ActualDate time.Time  // Добавляем поле для фактической даты из контента
+    ActualDate time.Time  // Скорректированная дата
     FileID     string
     IsValidURL bool       // Флаг валидности URL
 }
@@ -58,87 +58,56 @@ var (
     adminUserID int64 = 535803934 // замените на реальный 
 )
 
-// Добавляем функции для валидации и коррекции дат
-func parseActualDateFromContent(content string) (time.Time, error) {
-    // Ищем паттерн даты в заголовке расписания
-    patterns := []string{
-        `(\w+)\s+—\s+(\d{1,2})\.(\d{1,2})\.(\d{4})\s+г\.`,           // "пятница — 26.09.2025 г."
-        `(\w+)\s+(\d{1,2})\.(\d{1,2})\.(\d{4})\s+г\.`,               // "пятница 26.09.2025 г."
-        `(\d{1,2})\.(\d{1,2})\.(\d{4})`,                             // "26.09.2025"
-    }
+// Умная коррекция даты
+func smartDateCorrection(urlDate time.Time, fileName string) time.Time {
+    now := time.Now()
     
-    for _, pattern := range patterns {
-        re := regexp.MustCompile(pattern)
-        matches := re.FindStringSubmatch(content)
+    // Извлекаем день и месяц из URL
+    day := urlDate.Day()
+    month := int(urlDate.Month())
+    year := urlDate.Year()
+    
+    log.Printf("Анализируем дату из URL: %02d.%02d.%d", day, month, year)
+    
+    // Если URL содержит дату из далекого прошлого (более 30 дней назад)
+    daysDiff := now.Sub(urlDate).Hours() / 24
+    if daysDiff > 30 {
+        log.Printf("Обнаружена устаревшая дата (разница %.0f дней), корректируем...", daysDiff)
         
-        if len(matches) >= 4 {
-            var day, month, year int
-            var err error
-            
-            if len(matches) == 5 { // с днем недели
-                day, err = strconv.Atoi(matches[2])
-                if err != nil { continue }
-                month, err = strconv.Atoi(matches[3])
-                if err != nil { continue }
-                year, err = strconv.Atoi(matches[4])
-                if err != nil { continue }
-            } else { // только дата
-                day, err = strconv.Atoi(matches[1])
-                if err != nil { continue }
-                month, err = strconv.Atoi(matches[2])
-                if err != nil { continue }
-                year, err = strconv.Atoi(matches[3])
-                if err != nil { continue }
-            }
-            
-            return time.Date(year, time.Month(month), day, 0, 0, 0, 0, time.Local), nil
+        // Пробуем заменить месяц на текущий, оставляя день
+        correctedDate := time.Date(now.Year(), now.Month(), day, 0, 0, 0, 0, time.Local)
+        
+        // Если день больше количества дней в текущем месяце, берем последний день месяца
+        lastDayOfMonth := time.Date(now.Year(), now.Month()+1, 0, 0, 0, 0, 0, time.Local).Day()
+        if day > lastDayOfMonth {
+            correctedDate = time.Date(now.Year(), now.Month(), lastDayOfMonth, 0, 0, 0, 0, time.Local)
+            log.Printf("День %d больше чем дней в месяце, используем %d", day, lastDayOfMonth)
         }
+        
+        // Если скорректированная дата все еще в прошлом, пробуем следующий месяц
+        if now.Sub(correctedDate).Hours() > 24 {
+            nextMonth := now.AddDate(0, 1, 0)
+            correctedDate = time.Date(nextMonth.Year(), nextMonth.Month(), day, 0, 0, 0, 0, time.Local)
+            log.Printf("Текущий месяц в прошлом, пробуем следующий месяц")
+            
+            // Проверяем на валидность дня в следующем месяце
+            lastDayOfNextMonth := time.Date(nextMonth.Year(), nextMonth.Month()+1, 0, 0, 0, 0, 0, time.Local).Day()
+            if day > lastDayOfNextMonth {
+                correctedDate = time.Date(nextMonth.Year(), nextMonth.Month(), lastDayOfNextMonth, 0, 0, 0, 0, time.Local)
+            }
+        }
+        
+        log.Printf("Дата скорректирована: %s -> %s", 
+            urlDate.Format("02.01.2006"), 
+            correctedDate.Format("02.01.2006"))
+        
+        return correctedDate
     }
     
-    return time.Time{}, errors.New("actual date not found in content")
+    return urlDate
 }
 
-func validateScheduleDate(urlDate, actualDate time.Time) bool {
-    if actualDate.IsZero() {
-        return true // Если не удалось получить фактическую дату, считаем URL валидным
-    }
-    
-    // Проверяем разницу - если больше 7 дней, URL устарел
-    diff := actualDate.Sub(urlDate)
-    absDiff := diff
-    if absDiff < 0 {
-        absDiff = -absDiff
-    }
-    
-    return absDiff.Hours() < 168 // 7 дней
-}
-
-func correctScheduleURL(originalURL string, actualDate time.Time) string {
-    if actualDate.IsZero() {
-        return originalURL
-    }
-    
-    // Извлекаем компоненты URL
-    re := regexp.MustCompile(`/1Raspisanie/(\d{1,2})\.(\d{1,2})(?:\.(\d{4}))?(_korpus_[av]\.jpe?g)`)
-    matches := re.FindStringSubmatch(originalURL)
-    
-    if len(matches) < 4 {
-        return originalURL
-    }
-    
-    // Формируем новый URL с корректной датой
-    newURL := strings.Replace(originalURL, matches[0], 
-        fmt.Sprintf("/1Raspisanie/%02d.%02d.%d%s", 
-            actualDate.Day(), 
-            actualDate.Month(), 
-            actualDate.Year(),
-            matches[4]), 1)
-    
-    log.Printf("URL скорректирован: %s -> %s", originalURL, newURL)
-    return newURL
-}
-
-// Новые типы и очереди отправки
+// Типы для очередей отправки
 type sendResponse struct {
     Message *tgbotapi.Message
     Err     error
@@ -342,7 +311,6 @@ func main() {
     log.Fatal(http.ListenAndServe(":"+port, nil))
 }
 
-// Обновляем структуру таблицы для хранения фактических дат
 func ensureScheduleTable(ctx context.Context) error {
     _, err := db.Exec(ctx, `
     CREATE TABLE IF NOT EXISTS schedule_cache (
@@ -370,7 +338,6 @@ func ensureUsersTable(ctx context.Context) error {
     return err
 }
 
-// Обновляем функции загрузки и сохранения кэша
 func loadScheduleCache(ctx context.Context) (map[string]*ScheduleItem, map[string]*ScheduleItem, error) {
     rows, err := db.Query(ctx, "SELECT url, corpus, scraped_date, actual_date, file_id, COALESCE(is_valid_url, true) FROM schedule_cache")
     if err != nil {
@@ -709,7 +676,7 @@ func sendSchedule(chatID int64, corpus string) {
     for i, it := range items {
         <-ticker.C
         
-        // Используем фактическую дату для отображения, если доступна
+        // ВСЕГДА используем ActualDate для отображения, если она есть
         displayDate := it.Date
         if !it.ActualDate.IsZero() {
             displayDate = it.ActualDate
@@ -842,7 +809,7 @@ func uploadAndGetFileID(item *ScheduleItem) string {
     return fileID
 }
 
-// Обновляем основную функцию скрапинга
+// Обновленная функция скрапинга с умной коррекцией дат
 func scrapeImages() {
     defer func() {
         if r := recover(); r != nil {
@@ -872,13 +839,6 @@ func scrapeImages() {
     tempScheduleB := make(map[string]*ScheduleItem)
 
     re := regexp.MustCompile(`/1Raspisanie/(\d{1,2})\.(\d{1,2})(?:\.(\d{4}))?_korpus_([av])\.jpe?g(?:\?.*)?$`)
-    
-    // Добавляем переменную для хранения HTML контента страницы
-    var pageContent string
-
-    c.OnHTML("html", func(e *colly.HTMLElement) {
-        pageContent = e.Text
-    })
 
     c.OnHTML(`img[src*="/1Raspisanie/"]`, func(e *colly.HTMLElement) {
         src := e.Attr("src")
@@ -902,28 +862,14 @@ func scrapeImages() {
         urlDate := time.Date(year, time.Month(month), day, 0, 0, 0, 0, time.Local)
         fullURL := strings.TrimRight(baseSiteURL, "/") + path.Clean("/"+strings.TrimLeft(srcClean, "/"))
 
+        // Применяем умную коррекцию даты ВСЕГДА
+        correctedDate := smartDateCorrection(urlDate, srcClean)
+        
         item := &ScheduleItem{
             URL:        fullURL,
-            Date:       urlDate,
-            IsValidURL: true,
-        }
-
-        // Пытаемся извлечь фактическую дату из контента страницы
-        if actualDate, err := parseActualDateFromContent(pageContent); err == nil {
-            item.ActualDate = actualDate
-            
-            // Проверяем валидность URL
-            if !validateScheduleDate(urlDate, actualDate) {
-                item.IsValidURL = false
-                // Корректируем URL
-                correctedURL := correctScheduleURL(fullURL, actualDate)
-                if correctedURL != fullURL {
-                    item.URL = correctedURL
-                    item.Date = actualDate // Используем фактическую дату как основную
-                }
-                log.Printf("Обнаружено расхождение дат для корпуса %s: URL=%s, Actual=%s", 
-                    strings.ToUpper(corpus), urlDate.Format("02.01.2006"), actualDate.Format("02.01.2006"))
-            }
+            Date:       urlDate,        // Оригинальная дата из URL
+            ActualDate: correctedDate,  // Скорректированная дата
+            IsValidURL: urlDate.Equal(correctedDate), // false если была коррекция
         }
 
         var oldCache map[string]*ScheduleItem
@@ -937,21 +883,20 @@ func scrapeImages() {
             log.Printf("FileID для %s взят из кэша: %s", item.URL, item.FileID)
         }
 
-        displayDate := item.Date
-        if !item.ActualDate.IsZero() {
-            displayDate = item.ActualDate
+        displayDate := correctedDate // Всегда используем скорректированную дату для отображения
+        statusText := ""
+        if !item.IsValidURL {
+            statusText = " [Дата скорректирована]"
         }
 
         if corpus == "a" {
             tempScheduleA[item.URL] = item
             log.Printf("Найдено фото корпуса А: %s (%02d.%02d.%d)%s", 
-                item.URL, displayDate.Day(), displayDate.Month(), displayDate.Year(),
-                func() string { if !item.IsValidURL { return " [URL скорректирован]" }; return "" }())
+                item.URL, displayDate.Day(), displayDate.Month(), displayDate.Year(), statusText)
         } else {
             tempScheduleB[item.URL] = item
             log.Printf("Найдено фото корпуса Б: %s (%02d.%02d.%d)%s", 
-                item.URL, displayDate.Day(), displayDate.Month(), displayDate.Year(),
-                func() string { if !item.IsValidURL { return " [URL скорректирован]" }; return "" }())
+                item.URL, displayDate.Day(), displayDate.Month(), displayDate.Year(), statusText)
         }
     })
 
