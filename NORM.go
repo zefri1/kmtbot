@@ -394,6 +394,8 @@ func saveScheduleCache(ctx context.Context, scheduleA, scheduleB map[string]*Sch
         if !item.ActualDate.IsZero() {
             actualDate = item.ActualDate
         }
+        log.Printf("Сохранение в БД (корпус А): URL=%s, Date=%s, ActualDate=%v, IsValid=%v",
+            item.URL, item.Date.Format("2006-01-02"), actualDate, item.IsValidURL)
         if _, err := tx.Exec(ctx, "insert_schedule", item.URL, "a", item.Date, actualDate, item.FileID, item.IsValidURL); err != nil {
             return fmt.Errorf("tx.Exec INSERT A: %w", err)
         }
@@ -403,6 +405,8 @@ func saveScheduleCache(ctx context.Context, scheduleA, scheduleB map[string]*Sch
         if !item.ActualDate.IsZero() {
             actualDate = item.ActualDate
         }
+        log.Printf("Сохранение в БД (корпус Б): URL=%s, Date=%s, ActualDate=%v, IsValid=%v",
+            item.URL, item.Date.Format("2006-01-02"), actualDate, item.IsValidURL)
         if _, err := tx.Exec(ctx, "insert_schedule", item.URL, "b", item.Date, actualDate, item.FileID, item.IsValidURL); err != nil {
             return fmt.Errorf("tx.Exec INSERT B: %w", err)
         }
@@ -978,7 +982,17 @@ func scrapeImages() {
     scheduleA = newScheduleA
     scheduleB = newScheduleB
     mu.Unlock()
-    log.Println("Глобальные мапы расписаний обновлены.")
+    log.Printf("Глобальные мапы расписаний обновлены. Корпус А: %d записей, Корпус Б: %d записей", len(scheduleA), len(scheduleB))
+
+    // Выводим все URL для отладки
+    log.Println("=== Список всех URL корпуса А ===")
+    for url, item := range scheduleA {
+        log.Printf("  - %s (Date=%s, ActualDate=%s)", url, item.Date.Format("2006-01-02"), item.ActualDate.Format("2006-01-02"))
+    }
+    log.Println("=== Список всех URL корпуса Б ===")
+    for url, item := range scheduleB {
+        log.Printf("  - %s (Date=%s, ActualDate=%s)", url, item.Date.Format("2006-01-02"), item.ActualDate.Format("2006-01-02"))
+    }
 
     ctxSave := context.Background()
     if saveErr := saveScheduleCache(ctxSave, scheduleA, scheduleB); saveErr != nil {
