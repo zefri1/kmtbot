@@ -845,8 +845,10 @@ func scrapeImages() {
     c.OnHTML(`img[src*="/1Raspisanie/"]`, func(e *colly.HTMLElement) {
         src := e.Attr("src")
         srcClean := strings.Split(src, "?")[0]
+        log.Printf("Обработка изображения: %s", src)
         matches := re.FindStringSubmatch(srcClean)
         if len(matches) < 5 {
+            log.Printf("Изображение не соответствует паттерну: %s", srcClean)
             return
         }
         day, _ := strconv.Atoi(matches[1])
@@ -892,12 +894,18 @@ func scrapeImages() {
         }
 
         if corpus == "a" {
+            if _, exists := tempScheduleA[item.URL]; exists {
+                log.Printf("ВНИМАНИЕ: Дубликат URL для корпуса А: %s", item.URL)
+            }
             tempScheduleA[item.URL] = item
-            log.Printf("Найдено фото корпуса А: %s (%02d.%02d.%d)%s", 
+            log.Printf("Найдено фото корпуса А: %s (%02d.%02d.%d)%s",
                 item.URL, displayDate.Day(), displayDate.Month(), displayDate.Year(), statusText)
         } else {
+            if _, exists := tempScheduleB[item.URL]; exists {
+                log.Printf("ВНИМАНИЕ: Дубликат URL для корпуса Б: %s", item.URL)
+            }
             tempScheduleB[item.URL] = item
-            log.Printf("Найдено фото корпуса Б: %s (%02d.%02d.%d)%s", 
+            log.Printf("Найдено фото корпуса Б: %s (%02d.%02d.%d)%s",
                 item.URL, displayDate.Day(), displayDate.Month(), displayDate.Year(), statusText)
         }
     })
@@ -919,7 +927,7 @@ func scrapeImages() {
         return
     }
     c.Wait()
-    log.Println("Скрапинг HTML завершен.")
+    log.Printf("Скрапинг HTML завершен. Найдено: корпус А = %d, корпус Б = %d", len(tempScheduleA), len(tempScheduleB))
 
     log.Println("Начинаем загрузку новых изображений в Telegram...")
     uploadStart := time.Now()
