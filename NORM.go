@@ -675,14 +675,16 @@ func sendSchedule(chatID int64, corpus string) {
 
     for i, it := range items {
         <-ticker.C
-        
-        // ВСЕГДА используем ActualDate для отображения, если она есть
+
+        // Для дня недели ВСЕГДА используем Date (дата из URL)
+        // Для отображения числа используем ActualDate если есть коррекция
+        weekdayDate := it.Date
         displayDate := it.Date
         if !it.ActualDate.IsZero() {
             displayDate = it.ActualDate
         }
-        
-        weekday := weekdays[displayDate.Weekday()]
+
+        weekday := weekdays[weekdayDate.Weekday()]
         caption := fmt.Sprintf("%s — %02d.%02d.%d", weekday, displayDate.Day(), displayDate.Month(), displayDate.Year())
 
         var msg tgbotapi.Chattable
