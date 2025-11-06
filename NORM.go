@@ -37,6 +37,8 @@ const (
 	// Gemini API
 	geminiModel = "gemini-2.5-flash"
 	geminiURL   = "https://generativelanguage.googleapis.com/v1beta/models/" + geminiModel + ":generateContent"
+	// Глобальный лимит Gemini API - 9 запросов в минуту
+	geminiRPM = 9
 	// Для рассылки
 	broadcastRateLimit = 30 // ~30 сообщений в секунду
 	broadcastBatchSize = 30
@@ -101,7 +103,33 @@ var (
 	// Состояния пользователей для чат-бота
 	userStates        = make(map[int64]string)
 	userStatesMutex   sync.RWMutex
+	// Глобальный лимитер для Gemini API
+	geminiLimiter     chan struct{}
 )
+
+// Инициализация глобального лимитера для Gemini API
+func initGeminiLimiter() {
+	geminiLimiter = make(chan struct{}, geminiRPM)
+	// Заполняем канал токенами
+	for i := 0; i < geminiRPM; i++ {
+		geminiLimiter <- struct{}{}
+	}
+	
+	// Горутина для пополнения токенов каждые 60/geminiRPM секунд
+	go func() {
+		ticker := time.NewTicker(time.Duration(60/geminiRPM) * time.Second) // ~6.67 секунд между токенами
+		defer ticker.Stop()
+		
+		for range ticker.C {
+			select {
+			case geminiLimiter <- struct{}{}:
+				// Токен добавлен
+			default:
+				// Канал полон, пропускаем
+			}
+		}
+	}()
+}
 
 // Умная коррекция даты
 func smartDateCorrection(urlDate time.Time, fileName string) time.Time {
@@ -254,6 +282,18 @@ func callGemini(prompt string) (string, error) {
 	key := os.Getenv("GEMINI_API_KEY")
 	if key == "" {
 		return "", fmt.Errorf("GEMINI_API_KEY не задан")
+	}
+
+	// Ждем доступный токен из лимитера (с таймаутом 30 секунд)
+	timeout := time.NewTimer(30 * time.Second)
+	defer timeout.Stop()
+	
+	select {
+	case <-geminiLimiter:
+		// Получили токен, можем делать запрос
+		log.Printf("Получен токен для Gemini API запроса")
+	case <-timeout.C:
+		return "", fmt.Errorf("превышен лимит запросов к Gemini API, попробуйте позже")
 	}
 
 	reqBody := GRequest{
@@ -526,6 +566,10 @@ func main() {
 	if databaseURL == "" {
 		log.Fatal("DATABASE_URL не задан")
 	}
+
+	// Инициализируем глобальный лимитер для Gemini API
+	initGeminiLimiter()
+	log.Printf("Инициализирован глобальный лимитер Gemini API: %d запросов в минуту", geminiRPM)
 
 	ctx := context.Background()
 	cfg, err := pgxpool.ParseConfig(databaseURL)
@@ -893,8 +937,15 @@ func handleChatbotQuestion(chatID, userID int64, question string) {
 	answer, err := callGemini(question)
 	if err != nil {
 		log.Printf("Ошибка вызова Gemini API для пользователя %d: %v", userID, err)
-		errorMsg := "❌ Произошла ошибка при обработке вашего запроса. Проверьте переменную GEMINI_API_KEY и повторите попытку."
-		_, _ = enqueueUserSend(tgbotapi.NewMessage(chatID, errorMsg), 3*time.Second)
+		
+		// Проверяем, связана ли ошибка с лимитом
+		if strings.Contains(err.Error(), "превышен лимит") {
+			errorMsg := "⏳ Превышен лимит запросов к ИИ. Попробуйте через несколько секунд."
+			_, _ = enqueueUserSend(tgbotapi.NewMessage(chatID, errorMsg), 3*time.Second)
+		} else {
+			errorMsg := "❌ Произошла ошибка при обработке вашего запроса. Попробуйте позже."
+			_, _ = enqueueUserSend(tgbotapi.NewMessage(chatID, errorMsg), 3*time.Second)
+		}
 		return
 	}
 	
