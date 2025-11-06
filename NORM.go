@@ -345,7 +345,7 @@ func checkAndUpdateUserLimit(userID int64) (bool, int, error) {
 	}
 	
 	var user User
-	err := db.QueryRow(ctx, "SELECT id, chat_requests, last_reset_date FROM users WHERE id = $1", userID).Scan(
+	err := db.QueryRow(ctx, "SELECT id, COALESCE(chat_requests, 0), COALESCE(last_reset_date, now()) FROM users WHERE id = $1", userID).Scan(
 		&user.ID, &user.ChatRequests, &user.LastResetDate)
 	
 	if err != nil {
@@ -504,18 +504,32 @@ func ensureScheduleTable(ctx context.Context) error {
 }
 
 func ensureUsersTable(ctx context.Context) error {
+	// Сначала создаем таблицу, если её нет
 	_, err := db.Exec(ctx, `
 	CREATE TABLE IF NOT EXISTS users (
 		id BIGINT PRIMARY KEY,
 		username TEXT,
 		first_seen TIMESTAMPTZ DEFAULT now(),
 		last_seen TIMESTAMPTZ DEFAULT now(),
-		preferred_corpus TEXT,
-		chat_requests INTEGER DEFAULT 0,
-		last_reset_date TIMESTAMPTZ DEFAULT now()
+		preferred_corpus TEXT
 	);
 	`)
-	return err
+	if err != nil {
+		return fmt.Errorf("создание таблицы users: %w", err)
+	}
+	
+	// Добавляем новые колонки, если их нет (миграция)
+	_, err = db.Exec(ctx, `
+	ALTER TABLE users 
+	ADD COLUMN IF NOT EXISTS chat_requests INTEGER DEFAULT 0,
+	ADD COLUMN IF NOT EXISTS last_reset_date TIMESTAMPTZ DEFAULT now();
+	`)
+	if err != nil {
+		return fmt.Errorf("добавление колонок для чат-бота: %w", err)
+	}
+	
+	log.Println("Таблица users успешно создана/обновлена с поддержкой чат-бота")
+	return nil
 }
 
 func loadScheduleCache(ctx context.Context) (map[string]*ScheduleItem, map[string]*ScheduleItem, error) {
