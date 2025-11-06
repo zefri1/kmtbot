@@ -37,6 +37,9 @@ const (
 	// Gemini API
 	geminiModel = "gemini-2.5-flash"
 	geminiURL   = "https://generativelanguage.googleapis.com/v1beta/models/" + geminiModel + ":generateContent"
+	// Для рассылки
+	broadcastRateLimit = 30 // ~30 сообщений в секунду
+	broadcastBatchSize = 30
 )
 
 // Белый список для безлимитного доступа
@@ -360,6 +363,159 @@ func checkAndUpdateUserLimit(userID int64) (bool, int, error) {
 	return err == nil, remaining, err
 }
 
+// Новые функции для админ-команд
+// Проверка прав администратора
+func isAdmin(userID int64) bool {
+	return userID == adminUserID
+}
+
+// Рассылка сообщений всем пользователям
+func broadcastMessage(message string) error {
+	ctx := context.Background()
+	users, err := getUsers(ctx)
+	if err != nil {
+		return fmt.Errorf("ошибка получения пользователей: %w", err)
+	}
+
+	log.Printf("Начинаем рассылку сообщения %d пользователям", len(users))
+
+	// Создаем ticker для соблюдения rate limit
+	ticker := time.NewTicker(time.Second / broadcastRateLimit)
+	defer ticker.Stop()
+
+	successCount := 0
+	errorCount := 0
+
+	for i, user := range users {
+		<-ticker.C // Ждем разрешения на отправку
+
+		msg := tgbotapi.NewMessage(user.ID, message)
+		msg.ParseMode = "Markdown"
+
+		if err := enqueueFireAndForget(msg, true); err != nil {
+			log.Printf("Ошибка добавления сообщения в очередь для пользователя %d: %v", user.ID, err)
+			errorCount++
+		} else {
+			successCount++
+		}
+
+		// Логируем прогресс каждые 50 сообщений
+		if (i+1)%50 == 0 {
+			log.Printf("Рассылка: отправлено %d/%d сообщений", i+1, len(users))
+		}
+	}
+
+	log.Printf("Рассылка завершена: успешно=%d, ошибок=%d", successCount, errorCount)
+	return nil
+}
+
+// Обработка команды /message
+func handleMessageCommand(chatID int64, userID int64, args string) {
+	if !isAdmin(userID) {
+		_, _ = enqueueUserSend(tgbotapi.NewMessage(chatID, "❌ У вас нет доступа к этой команде."), 3*time.Second)
+		return
+	}
+
+	args = strings.TrimSpace(args)
+	if args != "" {
+		// Есть аргументы - сразу рассылаем
+		_, _ = enqueueUserSend(tgbotapi.NewMessage(chatID, "📤 Начинаю рассылку сообщения..."), 3*time.Second)
+		
+		go func() {
+			if err := broadcastMessage(args); err != nil {
+				log.Printf("Ошибка рассылки: %v", err)
+				_, _ = enqueueUserSend(tgbotapi.NewMessage(chatID, "❌ Ошибка при рассылке сообщения."), 3*time.Second)
+			} else {
+				_, _ = enqueueUserSend(tgbotapi.NewMessage(chatID, "✅ Рассылка завершена успешно."), 3*time.Second)
+			}
+		}()
+	} else {
+		// Нет аргументов - запрашиваем текст для рассылки
+		setUserState(userID, "waiting_for_broadcast_message")
+		_, _ = enqueueUserSend(tgbotapi.NewMessage(chatID, "📝 Отправьте текст для рассылки всем пользователям:"), 3*time.Second)
+	}
+}
+
+// Обработка команды /reload
+func handleReloadCommand(chatID int64, userID int64, args string) {
+	if !isAdmin(userID) {
+		_, _ = enqueueUserSend(tgbotapi.NewMessage(chatID, "❌ У вас нет доступа к этой команде."), 3*time.Second)
+		return
+	}
+
+	info := strings.TrimSpace(args)
+	if info == "" {
+		info = "Обновление системы"
+	}
+
+	messageText := fmt.Sprintf("🔄 Обновление бота: %s", info)
+
+	// Создаем inline-клавиатуру с кнопкой перезагрузки
+	inlineKeyboard := tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("🔄 Перезагрузить бота", "restart"),
+		),
+	)
+
+	_, _ = enqueueUserSend(tgbotapi.NewMessage(chatID, "📤 Начинаю рассылку уведомления об обновлении..."), 3*time.Second)
+
+	go func() {
+		ctx := context.Background()
+		users, err := getUsers(ctx)
+		if err != nil {
+			log.Printf("Ошибка получения пользователей для reload: %v", err)
+			_, _ = enqueueUserSend(tgbotapi.NewMessage(chatID, "❌ Ошибка при получении списка пользователей."), 3*time.Second)
+			return
+		}
+
+		log.Printf("Начинаем рассылку reload-уведомления %d пользователям", len(users))
+
+		// Создаем ticker для соблюдения rate limit
+		ticker := time.NewTicker(time.Second / broadcastRateLimit)
+		defer ticker.Stop()
+
+		successCount := 0
+		errorCount := 0
+
+		for i, user := range users {
+			<-ticker.C
+
+			msg := tgbotapi.NewMessage(user.ID, messageText)
+			msg.ReplyMarkup = inlineKeyboard
+
+			if err := enqueueFireAndForget(msg, true); err != nil {
+				log.Printf("Ошибка добавления reload-сообщения в очередь для пользователя %d: %v", user.ID, err)
+				errorCount++
+			} else {
+				successCount++
+			}
+
+			if (i+1)%50 == 0 {
+				log.Printf("Reload рассылка: отправлено %d/%d сообщений", i+1, len(users))
+			}
+		}
+
+		log.Printf("Reload рассылка завершена: успешно=%d, ошибок=%d", successCount, errorCount)
+		_, _ = enqueueUserSend(tgbotapi.NewMessage(chatID, "✅ Рассылка уведомления об обновлении завершена успешно."), 3*time.Second)
+	}()
+}
+
+// Обработка callback_query для перезагрузки
+func handleRestartCallback(callbackQuery *tgbotapi.CallbackQuery) {
+	userID := callbackQuery.From.ID
+	chatID := callbackQuery.Message.Chat.ID
+
+	// Отвечаем на callback_query без всплывающего алерта
+	callback := tgbotapi.NewCallback(callbackQuery.ID, "")
+	if _, err := bot.Request(callback); err != nil {
+		log.Printf("Ошибка ответа на callback_query: %v", err)
+	}
+
+	// Вызываем ту же логику, что и /start
+	sendStartMessage(chatID)
+	log.Printf("Пользователь %d перезагрузил бота через inline-кнопку", userID)
+}
+
 // main функция
 func main() {
 	telegramToken := os.Getenv("TELEGRAM_TOKEN")
@@ -609,16 +765,32 @@ func processUpdate(update tgbotapi.Update) {
 		}
 	}
 
+	// Обработка callback_query для inline-кнопок
+	if update.CallbackQuery != nil {
+		if update.CallbackQuery.Data == "restart" {
+			handleRestartCallback(update.CallbackQuery)
+		}
+		return
+	}
+
 	if update.Message != nil && update.Message.IsCommand() {
+		userID := update.Message.From.ID
+		chatID := update.Message.Chat.ID
+		commandArgs := update.Message.CommandArguments()
+
 		switch update.Message.Command() {
 		case "start":
-			sendStartMessage(update.Message.Chat.ID)
+			sendStartMessage(chatID)
 		case "stats":
-			if update.Message.From != nil && update.Message.From.ID == adminUserID {
-				go sendStatsToAdmin(update.Message.Chat.ID)
+			if isAdmin(userID) {
+				go sendStatsToAdmin(chatID)
 			} else {
-				_, _ = enqueueUserSend(tgbotapi.NewMessage(update.Message.Chat.ID, "У вас нет доступа к этой команде."), 3*time.Second)
+				_, _ = enqueueUserSend(tgbotapi.NewMessage(chatID, "У вас нет доступа к этой команде."), 3*time.Second)
 			}
+		case "message":
+			handleMessageCommand(chatID, userID, commandArgs)
+		case "reload":
+			handleReloadCommand(chatID, userID, commandArgs)
 		}
 	} else if update.Message != nil && update.Message.Text != "" {
 		userID := update.Message.From.ID
@@ -632,6 +804,25 @@ func processUpdate(update tgbotapi.Update) {
 			// Пользователь отправил вопрос для чат-бота
 			handleChatbotQuestion(chatID, userID, messageText)
 			clearUserState(userID)
+			return
+		} else if userState == "waiting_for_broadcast_message" {
+			// Админ отправил текст для рассылки
+			if isAdmin(userID) {
+				clearUserState(userID)
+				_, _ = enqueueUserSend(tgbotapi.NewMessage(chatID, "📤 Начинаю рассылку сообщения..."), 3*time.Second)
+				
+				go func() {
+					if err := broadcastMessage(messageText); err != nil {
+						log.Printf("Ошибка рассылки: %v", err)
+						_, _ = enqueueUserSend(tgbotapi.NewMessage(chatID, "❌ Ошибка при рассылке сообщения."), 3*time.Second)
+					} else {
+						_, _ = enqueueUserSend(tgbotapi.NewMessage(chatID, "✅ Рассылка завершена успешно."), 3*time.Second)
+					}
+				}()
+			} else {
+				clearUserState(userID)
+				_, _ = enqueueUserSend(tgbotapi.NewMessage(chatID, "❌ У вас нет прав для выполнения этого действия."), 3*time.Second)
+			}
 			return
 		}
 		
