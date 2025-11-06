@@ -1,0 +1,8 @@
+# render.yaml
+services:
+  - type: web
+    name: kmtbot 
+    env: go
+    buildCommand: go build -o ./bot . 
+    startCommand: ./bot 
+    
