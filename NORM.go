@@ -272,8 +272,8 @@ func callOpenRouterAPI(userMessage string) (string, error) {
 		return "", fmt.Errorf("ошибка сериализации JSON: %v", err)
 	}
 	
-	// Используем router.openrouter.ai для лучшей совместимости
-	req, err := http.NewRequest("POST", "https://router.openrouter.ai/api/v1/chat/completions", bytes.NewBuffer(jsonData))
+	// Используем правильный URL OpenRouter API
+	req, err := http.NewRequest("POST", "https://openrouter.ai/api/v1/chat/completions", bytes.NewBuffer(jsonData))
 	if err != nil {
 		return "", fmt.Errorf("ошибка создания запроса: %v", err)
 	}
