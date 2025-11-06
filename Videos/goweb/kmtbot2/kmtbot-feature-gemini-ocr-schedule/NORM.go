@@ -28,9 +28,9 @@ import (
 )
 
 const (
-	webhookPath = "/webhook"
-	baseSiteURL = "https://kmtko.my1.ru"
-	targetPath  = "/index/raspisanie_zanjatij_ochno/0-403"
+	webhookPath       = "/webhook"
+	baseSiteURL       = "https://kmtko.my1.ru"
+	targetPath        = "/index/raspisanie_zanjatij_ochno/0-403"
 	adminCommandStats = "/stats"
 	// Лимиты для чат-бота
 	dailyRequestLimit = 10
@@ -112,9 +112,9 @@ type User struct {
 type ScheduleItem struct {
 	URL        string
 	Date       time.Time
-	ActualDate time.Time  // Скорректированная дата
+	ActualDate time.Time // Скорректированная дата
 	FileID     string
-	IsValidURL bool       // Флаг валидности URL
+	IsValidURL bool // Флаг валидности URL
 }
 
 // Gemini API structures
@@ -144,7 +144,9 @@ type GCandidate struct {
 
 type GResponse struct {
 	Candidates []GCandidate `json:"candidates"`
-	Error      *struct{Message string `json:"message"`} `json:"error,omitempty"`
+	Error      *struct {
+		Message string `json:"message"`
+	} `json:"error,omitempty"`
 }
 
 // Gemini OCR structures
@@ -154,12 +156,12 @@ type GeminiScheduleResponse struct {
 }
 
 type ScheduleEntry struct {
-	Group      string   `json:"group"`
-	PairNumber int      `json:"pair_number"`
-	Subject    string   `json:"subject"`
-	Teacher    *string  `json:"teacher"`
-	Room       *string  `json:"room"`
-	Confidence float64  `json:"confidence"`
+	Group      string  `json:"group"`
+	PairNumber int     `json:"pair_number"`
+	Subject    string  `json:"subject"`
+	Teacher    *string `json:"teacher"`
+	Room       *string `json:"room"`
+	Confidence float64 `json:"confidence"`
 }
 
 type ScheduleMetadata struct {
@@ -174,15 +176,15 @@ var (
 	bot               *tgbotapi.BotAPI
 	db                *pgxpool.Pool
 	mu                sync.RWMutex
-	scheduleA         = make(map[string]*ScheduleItem)
-	scheduleB         = make(map[string]*ScheduleItem)
-	lastScrapeSuccess = false
-	adminUserID int64 = 535803934 // замените на реальный
+	scheduleA               = make(map[string]*ScheduleItem)
+	scheduleB               = make(map[string]*ScheduleItem)
+	lastScrapeSuccess       = false
+	adminUserID       int64 = 535803934 // замените на реальный
 	// Состояния пользователей для чат-бота
-	userStates        = make(map[int64]string)
-	userStatesMutex   sync.RWMutex
+	userStates      = make(map[int64]string)
+	userStatesMutex sync.RWMutex
 	// Глобальный лимитер для Gemini API
-	geminiLimiter     chan struct{}
+	geminiLimiter chan struct{}
 )
 
 // Инициализация глобального лимитера для Gemini API
@@ -192,12 +194,12 @@ func initGeminiLimiter() {
 	for i := 0; i < geminiRPM; i++ {
 		geminiLimiter <- struct{}{}
 	}
-	
+
 	// Горутина для пополнения токенов каждые 60/geminiRPM секунд
 	go func() {
 		ticker := time.NewTicker(time.Duration(60/geminiRPM) * time.Second) // ~6.67 секунд между токенами
 		defer ticker.Stop()
-		
+
 		for range ticker.C {
 			select {
 			case geminiLimiter <- struct{}{}:
@@ -212,49 +214,49 @@ func initGeminiLimiter() {
 // Умная коррекция даты
 func smartDateCorrection(urlDate time.Time, fileName string) time.Time {
 	now := time.Now()
-	
+
 	// Извлекаем день и месяц из URL
 	day := urlDate.Day()
 	month := int(urlDate.Month())
 	year := urlDate.Year()
-	
+
 	log.Printf("Анализируем дату из URL: %02d.%02d.%d", day, month, year)
-	
+
 	// Если URL содержит дату из далекого прошлого (более 30 дней назад)
 	daysDiff := now.Sub(urlDate).Hours() / 24
 	if daysDiff > 30 {
 		log.Printf("Обнаружена устаревшая дата (разница %.0f дней), корректируем...", daysDiff)
-		
+
 		// Пробуем заменить месяц на текущий, оставляя день
 		correctedDate := time.Date(now.Year(), now.Month(), day, 0, 0, 0, 0, time.Local)
-		
+
 		// Если день больше количества дней в текущем месяце, берем последний день месяца
 		lastDayOfMonth := time.Date(now.Year(), now.Month()+1, 0, 0, 0, 0, 0, time.Local).Day()
 		if day > lastDayOfMonth {
 			correctedDate = time.Date(now.Year(), now.Month(), lastDayOfMonth, 0, 0, 0, 0, time.Local)
 			log.Printf("День %d больше чем дней в месяце, используем %d", day, lastDayOfMonth)
 		}
-		
+
 		// Если скорректированная дата все еще в прошлом, пробуем следующий месяц
 		if now.Sub(correctedDate).Hours() > 24 {
 			nextMonth := now.AddDate(0, 1, 0)
 			correctedDate = time.Date(nextMonth.Year(), nextMonth.Month(), day, 0, 0, 0, 0, time.Local)
 			log.Printf("Текущий месяц в прошлом, пробуем следующий месяц")
-			
+
 			// Проверяем на валидность дня в следующем месяце
 			lastDayOfNextMonth := time.Date(nextMonth.Year(), nextMonth.Month()+1, 0, 0, 0, 0, 0, time.Local).Day()
 			if day > lastDayOfNextMonth {
 				correctedDate = time.Date(nextMonth.Year(), nextMonth.Month(), lastDayOfNextMonth, 0, 0, 0, 0, time.Local)
 			}
 		}
-		
-		log.Printf("Дата скорректирована: %s -> %s", 
-			urlDate.Format("02.01.2006"), 
+
+		log.Printf("Дата скорректирована: %s -> %s",
+			urlDate.Format("02.01.2006"),
 			correctedDate.Format("02.01.2006"))
-		
+
 		return correctedDate
 	}
-	
+
 	return urlDate
 }
 
@@ -270,8 +272,8 @@ type sendTask struct {
 }
 
 var (
-	userSendQueue   chan sendTask
-	uploaderQueue   chan sendTask
+	userSendQueue chan sendTask
+	uploaderQueue chan sendTask
 )
 
 func startSenderPool(workers int, queue chan sendTask) {
@@ -365,7 +367,7 @@ func callGemini(prompt string) (string, error) {
 	// Ждем доступный токен из лимитера (с таймаутом 30 секунд)
 	timeout := time.NewTimer(30 * time.Second)
 	defer timeout.Stop()
-	
+
 	select {
 	case <-geminiLimiter:
 		// Получили токен, можем делать запрос
@@ -376,26 +378,34 @@ func callGemini(prompt string) (string, error) {
 
 	reqBody := GRequest{
 		SystemInstruction: &GContent{Parts: []GPart{{Text: "Отвечай кратко, по-русски, без Markdown ссылок."}}},
-		Contents: []GContent{{Role: "user", Parts: []GPart{{Text: prompt}}}},
+		Contents:          []GContent{{Role: "user", Parts: []GPart{{Text: prompt}}}},
 	}
 	b, _ := json.Marshal(reqBody)
 
 	req, err := http.NewRequest("POST", geminiURL, bytes.NewBuffer(b))
-	if err != nil { return "", err }
+	if err != nil {
+		return "", err
+	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("x-goog-api-key", key)
 
 	client := &http.Client{Timeout: 45 * time.Second}
 	resp, err := client.Do(req)
-	if err != nil { return "", err }
+	if err != nil {
+		return "", err
+	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK {
 		return "", fmt.Errorf("Gemini API %d: %s", resp.StatusCode, string(body))
 	}
 	var gr GResponse
-	if err := json.Unmarshal(body, &gr); err != nil { return "", err }
-	if gr.Error != nil { return "", fmt.Errorf("Gemini error: %s", gr.Error.Message) }
+	if err := json.Unmarshal(body, &gr); err != nil {
+		return "", err
+	}
+	if gr.Error != nil {
+		return "", fmt.Errorf("Gemini error: %s", gr.Error.Message)
+	}
 	if len(gr.Candidates) == 0 || len(gr.Candidates[0].Content.Parts) == 0 {
 		return "", fmt.Errorf("Gemini вернул пустой ответ")
 	}
@@ -429,24 +439,24 @@ func checkAndUpdateUserLimit(userID int64) (bool, int, error) {
 		log.Printf("Пользователь %d в белом списке - безлимитный доступ", userID)
 		return true, 999, nil // безлимитный доступ
 	}
-	
+
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	
+
 	now := time.Now()
 	moscowTZ, _ := time.LoadLocation("Europe/Moscow")
 	nowMoscow := now.In(moscowTZ)
 	resetTime := time.Date(nowMoscow.Year(), nowMoscow.Month(), nowMoscow.Day(), limitResetHour, 0, 0, 0, moscowTZ)
-	
+
 	// Если сейчас раньше времени сброса, то берем сброс предыдущего дня
 	if nowMoscow.Before(resetTime) {
 		resetTime = resetTime.AddDate(0, 0, -1)
 	}
-	
+
 	var user User
 	err := db.QueryRow(ctx, "SELECT id, COALESCE(chat_requests, 0), COALESCE(last_reset_date, now()) FROM users WHERE id = $1", userID).Scan(
 		&user.ID, &user.ChatRequests, &user.LastResetDate)
-	
+
 	if err != nil {
 		if err == sql.ErrNoRows {
 			// Пользователь не найден, создаем запись
@@ -459,19 +469,19 @@ func checkAndUpdateUserLimit(userID int64) (bool, int, error) {
 		}
 		return false, 0, err
 	}
-	
+
 	// Проверяем, нужно ли сбросить счетчик
 	if user.LastResetDate.Before(resetTime) {
 		// Сбрасываем счетчик
 		_, err = db.Exec(ctx, "UPDATE users SET chat_requests = 1, last_reset_date = $1 WHERE id = $2", resetTime, userID)
 		return err == nil, dailyRequestLimit - 1, err
 	}
-	
+
 	// Проверяем лимит
 	if user.ChatRequests >= dailyRequestLimit {
 		return false, 0, nil
 	}
-	
+
 	// Увеличиваем счетчик
 	_, err = db.Exec(ctx, "UPDATE users SET chat_requests = chat_requests + 1 WHERE id = $1", userID)
 	remaining := dailyRequestLimit - user.ChatRequests - 1
@@ -538,7 +548,7 @@ func handleMessageCommand(chatID int64, userID int64, args string) {
 	if args != "" {
 		// Есть аргументы - сразу рассылаем
 		_, _ = enqueueUserSend(tgbotapi.NewMessage(chatID, "📤 Начинаю рассылку сообщения..."), 3*time.Second)
-		
+
 		go func() {
 			if err := broadcastMessage(args); err != nil {
 				log.Printf("Ошибка рассылки: %v", err)
@@ -892,7 +902,7 @@ func saveScheduleCache(ctx context.Context, scheduleA, scheduleB map[string]*Sch
 		return fmt.Errorf("tx.Exec DELETE: %w", err)
 	}
 
-	if _, err := tx.Prepare(ctx, "insert_schedule", 
+	if _, err := tx.Prepare(ctx, "insert_schedule",
 		"INSERT INTO schedule_cache (url, corpus, scraped_date, actual_date, file_id, is_valid_url) VALUES ($1, $2, $3, $4, $5, $6)"); err != nil {
 		return fmt.Errorf("tx.Prepare: %w", err)
 	}
@@ -976,10 +986,10 @@ func processUpdate(update tgbotapi.Update) {
 		userID := update.Message.From.ID
 		chatID := update.Message.Chat.ID
 		messageText := update.Message.Text
-		
+
 		// Проверяем состояние пользователя
 		userState := getUserState(userID)
-		
+
 		if userState == "waiting_for_question" {
 			// Пользователь отправил вопрос для чат-бота
 			handleChatbotQuestion(chatID, userID, messageText)
@@ -990,7 +1000,7 @@ func processUpdate(update tgbotapi.Update) {
 			if isAdmin(userID) {
 				clearUserState(userID)
 				_, _ = enqueueUserSend(tgbotapi.NewMessage(chatID, "📤 Начинаю рассылку сообщения..."), 3*time.Second)
-				
+
 				go func() {
 					if err := broadcastMessage(messageText); err != nil {
 						log.Printf("Ошибка рассылки: %v", err)
@@ -1005,7 +1015,7 @@ func processUpdate(update tgbotapi.Update) {
 			}
 			return
 		}
-		
+
 		switch messageText {
 		case "Расписание А":
 			log.Printf("Пользователь %d (%s) запросил расписание корпуса А", update.Message.From.ID, update.Message.From.UserName)
@@ -1037,43 +1047,43 @@ func startChatbotSession(chatID, userID int64) {
 		_, _ = enqueueUserSend(tgbotapi.NewMessage(chatID, "Произошла ошибка. Попробуйте позже."), 3*time.Second)
 		return
 	}
-	
+
 	if !allowed {
 		msg := "❌ Вы исчерпали дневной лимит запросов к чат-боту (10 запросов в день).\n\n" +
 			"🕒 Лимит обновляется каждый день в 3:00 по московскому времени."
 		_, _ = enqueueUserSend(tgbotapi.NewMessage(chatID, msg), 3*time.Second)
 		return
 	}
-	
+
 	// Устанавливаем состояние ожидания вопроса
 	setUserState(userID, "waiting_for_question")
-	
+
 	var limitInfo string
 	if unlimitedUserIDs[userID] {
 		limitInfo = "📊 У вас безлимитный доступ!"
 	} else {
 		limitInfo = fmt.Sprintf("📊 Осталось запросов сегодня: %d/10\n🕒 Лимит обновляется в 3:00 МСК", remaining)
 	}
-	
-	msg := fmt.Sprintf("🤖 Добро пожаловать в чат-бот!\n\n" +
-		"💬 Напишите ваш вопрос, и я отвечу на него.\n\n" +
+
+	msg := fmt.Sprintf("🤖 Добро пожаловать в чат-бот!\n\n"+
+		"💬 Напишите ваш вопрос, и я отвечу на него.\n\n"+
 		"%s", limitInfo)
-	
+
 	_, _ = enqueueUserSend(tgbotapi.NewMessage(chatID, msg), 3*time.Second)
 }
 
 func handleChatbotQuestion(chatID, userID int64, question string) {
 	log.Printf("Пользователь %d задал вопрос чат-боту: %s", userID, question)
-	
+
 	// Отправляем сообщение о том, что обрабатываем запрос
 	processingMsg := "🔄 Обрабатываю ваш запрос, пожалуйста подождите..."
 	_, _ = enqueueUserSend(tgbotapi.NewMessage(chatID, processingMsg), 3*time.Second)
-	
+
 	// Вызываем Gemini API
 	answer, err := callGemini(question)
 	if err != nil {
 		log.Printf("Ошибка вызова Gemini API для пользователя %d: %v", userID, err)
-		
+
 		// Проверяем, связана ли ошибка с лимитом
 		if strings.Contains(err.Error(), "превышен лимит") {
 			errorMsg := "⏳ Превышен лимит запросов к ИИ. Попробуйте через несколько секунд."
@@ -1084,18 +1094,18 @@ func handleChatbotQuestion(chatID, userID int64, question string) {
 		}
 		return
 	}
-	
+
 	// Ограничиваем длину ответа (Telegram имеет лимит 4096 символов)
 	if len(answer) > 4000 {
 		answer = answer[:4000] + "...\n\n[Ответ сокращен из-за ограничений Telegram]"
 	}
-	
+
 	// Отправляем ответ
 	responseMsg := fmt.Sprintf("🤖 **Ответ:**\n\n%s", answer)
 	msg := tgbotapi.NewMessage(chatID, responseMsg)
 	msg.ParseMode = "Markdown"
 	_, _ = enqueueUserSend(msg, 10*time.Second)
-	
+
 	log.Printf("Отправлен ответ чат-бота пользователю %d", userID)
 }
 
@@ -1504,11 +1514,11 @@ func scrapeImages() {
 
 		// Применяем умную коррекцию даты ВСЕГДА
 		correctedDate := smartDateCorrection(urlDate, srcClean)
-		
+
 		item := &ScheduleItem{
 			URL:        fullURL,
-			Date:       urlDate,        // Оригинальная дата из URL
-			ActualDate: correctedDate,  // Скорректированная дата
+			Date:       urlDate,                      // Оригинальная дата из URL
+			ActualDate: correctedDate,                // Скорректированная дата
 			IsValidURL: urlDate.Equal(correctedDate), // false если была коррекция
 		}
 
@@ -1702,13 +1712,17 @@ func callGeminiWithRequest(reqBody GRequest) (string, error) {
 
 	b, _ := json.Marshal(reqBody)
 	req, err := http.NewRequest("POST", geminiURL, bytes.NewBuffer(b))
-	if err != nil { return "", err }
+	if err != nil {
+		return "", err
+	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("x-goog-api-key", key)
 
 	client := &http.Client{Timeout: 90 * time.Second} // Увеличено для OCR
 	resp, err := client.Do(req)
-	if err != nil { return "", err }
+	if err != nil {
+		return "", err
+	}
 	defer resp.Body.Close()
 
 	body, _ := io.ReadAll(resp.Body)
@@ -1717,8 +1731,12 @@ func callGeminiWithRequest(reqBody GRequest) (string, error) {
 	}
 
 	var gr GResponse
-	if err := json.Unmarshal(body, &gr); err != nil { return "", err }
-	if gr.Error != nil { return "", fmt.Errorf("Gemini error: %s", gr.Error.Message) }
+	if err := json.Unmarshal(body, &gr); err != nil {
+		return "", err
+	}
+	if gr.Error != nil {
+		return "", fmt.Errorf("Gemini error: %s", gr.Error.Message)
+	}
 	if len(gr.Candidates) == 0 || len(gr.Candidates[0].Content.Parts) == 0 {
 		return "", fmt.Errorf("Gemini вернул пустой ответ")
 	}
@@ -1812,7 +1830,7 @@ func processScheduleOCR(item *ScheduleItem, corpus string) error {
 				raw_json = EXCLUDED.raw_json,
 				updated_at = now()
 		`, item.URL, item.Date, corpus, entry.Group, entry.PairNumber,
-		   entry.Subject, entry.Teacher, entry.Room, entry.Confidence, status, jsonResponse)
+			entry.Subject, entry.Teacher, entry.Room, entry.Confidence, status, jsonResponse)
 
 		if err != nil {
 			log.Printf("Ошибка вставки в БД: %v", err)
