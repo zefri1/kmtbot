@@ -1340,7 +1340,7 @@ func scrapeImages() {
 	tempScheduleA := make(map[string]*ScheduleItem)
 	tempScheduleB := make(map[string]*ScheduleItem)
 
-	re := regexp.MustCompile(`/1Raspisanie/(\d{1,2})\.(\d{1,2})(?:\.(\d{4}))?_korpus_([av])\.jpe?g(?:\?.*)?$`)
+	re := regexp.MustCompile(`/1Raspisanie/(\d{1,2})[\.\-](\d{1,2})(?:[\.\-](\d{4}))?_korpus_([av])\d*\.jpe?g(?:\?.*)?$`)
 
 	c.OnHTML(`img[src*="/1Raspisanie/"]`, func(e *colly.HTMLElement) {
 		src := e.Attr("src")
